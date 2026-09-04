@@ -41,9 +41,8 @@ let maybe_validate_ip cert = function
   | None -> true
   | Some ip -> Certificate.supports_ip cert ip
 
-let issuer_matches_subject
-    { Certificate.asn = parent ; _ } { Certificate.asn = cert ; _ } =
-  Distinguished_name.equal parent.tbs_cert.subject cert.tbs_cert.issuer
+let issuer_matches_subject parent cert =
+  Distinguished_name.equal (Certificate.subject parent) (Certificate.issuer cert)
 
 let is_self_signed cert = issuer_matches_subject cert cert
 
@@ -101,7 +100,9 @@ let raw_cert_hack raw =
 
 let validate_signature allowed_hashes { Certificate.asn = trusted ; _ } { Certificate.asn ; raw } =
   let tbs_raw = raw_cert_hack raw in
-  validate_raw_signature asn.tbs_cert.subject allowed_hashes tbs_raw
+  validate_raw_signature
+    (Distinguished_name.Encoded.to_legacy_lossy asn.tbs_cert.subject)
+    allowed_hashes tbs_raw
     asn.signature_algo asn.signature_val trusted.tbs_cert.pk_info
 
 let validate_time time { Certificate.asn = cert ; _ } =

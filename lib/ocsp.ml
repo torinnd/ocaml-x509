@@ -20,8 +20,8 @@ let create_cert_id ?(hash=`SHA1) issuer serialNumber =
   let hashAlgorithm = Algorithm.of_hash hash in
   let module Hash = (val (Digestif.module_of_hash' (hash :> Digestif.hash'))) in
   let issuerNameHash =
-    Certificate.subject issuer
-    |> Distinguished_name.encode_der
+    Certificate.subject_encoded issuer
+    |> Distinguished_name.Encoded.encode_der
     |> Hash.(fun x -> to_raw_string (digest_string x))
   in
   let issuerKeyHash =

@@ -159,6 +159,20 @@ let common_name t =
       | Some CN x -> Some x | _ -> acc)
     None t
 
+(* Keep the ASN.1 choice and every RDN member, rather than passing through
+   the legacy set of untagged attributes. Strings contain content octets. *)
+type encoded_string = [
+  | `C1 of string | `C2 of string | `C3 of string
+  | `C4 of string | `C5 of string | `C6 of string
+]
+
+type encoded_name = (Asn.oid * encoded_string) list list
+
+type retained_name = {
+  representation : encoded_name ;
+  legacy : t ;
+}
+
 module Asn = struct
   open Asn.S
   open Asn_grammars
@@ -175,12 +189,7 @@ module Asn = struct
       utf8_string printable_string
       ia5_string universal_string teletex_string bmp_string
 
-  (* We flatten the sequence-of-set-of-tuple here into a single list.
-  * This means that we can't write non-singleton sets back.
-  * Does anyone need that, ever?
-  *)
-
-  let name =
+  let attribute_of_asn, attribute_to_asn =
     let open Registry in
     let of_c = function
       | `C1 x | `C2 x | `C3 x | `C4 x | `C5 x | `C6 x -> x in
@@ -228,23 +237,38 @@ module Asn = struct
       | Other (oid, x) -> (oid, `C1 x )
     in
 
+    a_f, a_g
+
+  let encoded_name : encoded_name Asn.t =
     let attribute_tv =
-      map a_f a_g @@
       sequence2
-        (required ~label:"attr type"  oid)
-        (* This is ANY according to rfc5280. *)
+        (required ~label:"attr type" oid)
+        (* Not arbitrary ANY: only the six string alternatives above. *)
         (required ~label:"attr value" directory_name)
     in
-    let rd_name =
-      let f exts =
-        List.fold_left
-          (fun set attr -> Relative_distinguished_name.add attr set)
-          Relative_distinguished_name.empty exts
-      and g map = Relative_distinguished_name.elements map
-      in
-      map f g @@ set_of attribute_tv
-    in
-    sequence_of rd_name (* A vacuous choice, in the standard. *)
+    sequence_of (set_of attribute_tv)
+
+  let to_legacy_lossy name =
+    List.map (fun rdn ->
+        List.fold_left (fun set attr ->
+            Relative_distinguished_name.add (attribute_of_asn attr) set)
+          Relative_distinguished_name.empty rdn)
+      name
+
+  let of_legacy name =
+    List.map (fun rdn ->
+        List.map attribute_to_asn (Relative_distinguished_name.elements rdn))
+      name
+
+  let name = map to_legacy_lossy of_legacy encoded_name
+
+  let retained_name =
+    map (fun representation ->
+        { representation ; legacy = to_legacy_lossy representation })
+      (fun { representation ; _ } -> representation) encoded_name
+
+  let retained_name_of_octets, retained_name_to_octets =
+    projections_of Asn.der retained_name
 
   let (name_of_octets, name_to_octets) =
     projections_of Asn.der name
@@ -253,3 +277,21 @@ end
 let decode_der cs = Asn_grammars.err_to_msg (Asn.name_of_octets cs)
 
 let encode_der = Asn.name_to_octets
+
+module Encoded = struct
+  type legacy = t
+  type t = retained_name
+
+  let decode_der cs = Asn_grammars.err_to_msg (Asn.retained_name_of_octets cs)
+  let encode_der = Asn.retained_name_to_octets
+  let to_legacy_lossy { legacy ; _ } = legacy
+
+  (* Keep the supplied legacy view: Other (known_oid, x) must not silently
+     become a named constructor merely by passing through a fresh object. *)
+  let of_legacy legacy = { representation = Asn.of_legacy legacy ; legacy }
+
+  (* Internal codec; the public interface exposes only the abstract value. *)
+  module Asn = struct
+    let name = Asn.retained_name
+  end
+end

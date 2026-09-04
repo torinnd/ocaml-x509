@@ -338,7 +338,195 @@ let ec_priv file pub_file () =
     Alcotest.(check string "PEM encoding of EC public key (derived from private key) is identical"
                 pub (Public_key.encode_pem (Private_key.public priv)))
 
+(* Literal DER, independent of the name encoder under test: CN=Test. *)
+let printable_name_der = Ohex.decode "300f310d300b0603550403130454657374"
+let utf8_name_der = Ohex.decode "300f310d300b06035504030c0454657374"
+
+let name_ok what = function
+  | Ok x -> x
+  | Error _ -> Alcotest.fail what
+
+let encoded_name der =
+  name_ok "decode encoded name" (Distinguished_name.Encoded.decode_der der)
+
+let check_encoded_name what expected name =
+  Alcotest.(check string what expected
+              (Distinguished_name.Encoded.encode_der name))
+
+let test_encoded_name () =
+  let module E = Distinguished_name.Encoded in
+  let name = encoded_name printable_name_der in
+  check_encoded_name "PrintableString survives" printable_name_der name;
+  let legacy = E.to_legacy_lossy name in
+  let expected = Distinguished_name.[Relative_distinguished_name.singleton (CN "Test")] in
+  Alcotest.check check_dn "legacy constructors unchanged" expected legacy;
+  Alcotest.check check_dn "same view as legacy decoder" legacy
+    (name_ok "decode legacy name" (Distinguished_name.decode_der printable_name_der));
+  Alcotest.(check string "legacy encoding is deliberately lossy" utf8_name_der
+              (Distinguished_name.encode_der legacy));
+  check_encoded_name "fresh legacy name uses UTF8" utf8_name_der (E.of_legacy legacy);
+  List.iter (fun hex ->
+      let der = Ohex.decode hex in
+      check_encoded_name "string tag and content octets survive" der (encoded_name der))
+    [ "300f310d300b06035504030c0454657374" ; (* UTF8 *)
+      "300f310d300b0603550403160454657374" ; (* IA5 *)
+      "300f310d300b0603550403140454657374" ; (* Teletex *)
+      "300c310a300806035504031401e9" ; (* Teletex, not UTF8 *)
+      "30133111300f06035504031e080054006500730074" ; (* BMP *)
+      "301b3119301706035504031c1000000054000000650000007300000074" ; (* Universal *)
+      "300e310c300a06022a03130454657374" ; (* unknown OID, known value type *)
+      "3000" ];
+  let collision = Ohex.decode
+      "301c311a300b06035504030c0454657374300b0603550403130454657374" in
+  let both = encoded_name collision in
+  check_encoded_name "both members of one RDN survive" collision both;
+  Alcotest.check check_dn "legacy set merges a tag-only distinction"
+    expected (E.to_legacy_lossy both);
+  let two_rdns = Ohex.decode
+      "301e310d300b0603550403130454657374310d300b06035504030c0454657374" in
+  check_encoded_name "RDN sequence order survives" two_rdns (encoded_name two_rdns);
+  let defaults = Distinguished_name.[
+      Relative_distinguished_name.singleton (C "GB");
+      Relative_distinguished_name.singleton (Serialnumber "123");
+      Relative_distinguished_name.singleton (DNQ "q");
+      Relative_distinguished_name.singleton (DC "com");
+      Relative_distinguished_name.singleton (Mail "a@b")
+    ] in
+  (* Country/serial/qualifier stay PrintableString; DC/mail stay IA5String. *)
+  let default_der = Ohex.decode
+      "3050310b3009060355040613024742310c300a06035504051303313233310a3008060355042e13017131133011060a0992268993f22c6401191603636f6d3112301006092a864886f70d0109011603614062" in
+  check_encoded_name "fresh legacy defaults" default_der (E.of_legacy defaults);
+  let alias = Distinguished_name.[Relative_distinguished_name.singleton
+      (Other (Asn.OID.(base 2 5 <| 4 <| 3), "Test"))] in
+  Alcotest.check check_dn "fresh legacy Other alias is not normalized"
+    alias (E.to_legacy_lossy (E.of_legacy alias));
+  List.iter (fun der ->
+      match E.decode_der der with
+      | Error _ -> ()
+      | Ok _ -> Alcotest.fail "unexpectedly accepted unsupported or trailing data")
+    [ printable_name_der ^ "\x00";
+      Ohex.decode "300c310a30080603550403040178" ]
+
+let test_encoded_name_issuance () =
+  let module E = Distinguished_name.Encoded in
+  let name = encoded_name printable_name_der in
+  let root = encoded_name (Ohex.decode "300f310d300b06035504031304526f6f74") in
+  let key = match Mirage_crypto_ec.Ed25519.priv_of_octets ed25519_priv with
+    | Ok k -> `ED25519 k
+    | Error _ -> Alcotest.fail "decode Ed25519 test key"
+  in
+  let valid_from, valid_until =
+    match Ptime.of_date (2024, 1, 1), Ptime.of_date (2025, 1, 1) with
+    | Some a, Some b -> a, b
+    | _ -> assert false
+  in
+  let decode_cert result =
+    let cert = name_ok "sign certificate" result in
+    name_ok "decode signed certificate"
+      (Certificate.decode_der (Certificate.encode_der cert))
+  in
+  let request = name_ok "create encoded CSR" (Signing_request.create_encoded name key) in
+  let request = name_ok "decode encoded CSR"
+      (Signing_request.decode_der (Signing_request.encode_der request)) in
+  check_encoded_name "CSR accessor retains PrintableString" printable_name_der
+    (Signing_request.subject_encoded request);
+  Alcotest.check check_dn "CSR info is a lossy view" (E.to_legacy_lossy name)
+    (Signing_request.info request).subject;
+  let ca_extensions = Extension.(
+      add Basic_constraints (true, (true, None))
+        (singleton Key_usage (true, [ `Key_cert_sign ]))) in
+  let ca = decode_cert (Signing_request.sign_encoded request
+      ~valid_from ~valid_until ~serial:"\x01" ~extensions:ca_extensions key root) in
+  check_encoded_name "CA subject" printable_name_der (Certificate.subject_encoded ca);
+  check_encoded_name "CA issuer differs from CA subject" (E.encode_der root)
+    (Certificate.issuer_encoded ca);
+  let leaf = decode_cert (Signing_request.sign_certificate request
+      ~valid_from ~valid_until ~serial:"\x02" key ca) in
+  check_encoded_name "legacy sign_certificate retains issuer" printable_name_der
+    (Certificate.issuer_encoded leaf);
+  check_encoded_name "legacy sign_certificate retains CSR subject" printable_name_der
+    (Certificate.subject_encoded leaf);
+  let verify leaf =
+    match Validation.verify_chain ~host:None ~time:(fun () -> None) ~anchors:[ca] [leaf] with
+    | Ok _ -> ()
+    | Error e -> Alcotest.failf "issued signature/chain invalid: %a" Validation.pp_chain_error e
+  in
+  verify leaf;
+  let legacy = Certificate.subject ca in
+  Alcotest.check check_dn "certificate accessor is a lossy view"
+    (E.to_legacy_lossy name) legacy;
+  let legacy_issuer = decode_cert (Signing_request.sign request
+      ~valid_from ~valid_until ~serial:"\x03" key legacy) in
+  check_encoded_name "legacy issuer argument uses defaults" utf8_name_der
+    (Certificate.issuer_encoded legacy_issuer);
+  check_encoded_name "legacy sign retains CSR subject by default" printable_name_der
+    (Certificate.subject_encoded legacy_issuer);
+  (* Tag-insensitive matching has not changed. *)
+  verify legacy_issuer;
+  let override = decode_cert (Signing_request.sign_certificate request
+      ~valid_from ~valid_until ~serial:"\x04" ~subject:legacy key ca) in
+  check_encoded_name "explicit equal legacy subject selects defaults" utf8_name_der
+    (Certificate.subject_encoded override);
+  let override = decode_cert (Signing_request.sign_certificate_encoded request
+      ~valid_from ~valid_until ~serial:"\x05" ~subject:root key ca) in
+  check_encoded_name "encoded override replaces whole subject" (E.encode_der root)
+    (Certificate.subject_encoded override);
+  check_encoded_name "encoded override does not replace issuer" printable_name_der
+    (Certificate.issuer_encoded override);
+  verify override;
+  let collision_der = Ohex.decode
+      "301c311a300b06035504030c0454657374300b0603550403130454657374" in
+  let collision = encoded_name collision_der in
+  let multi_request = name_ok "create multi-valued CSR"
+      (Signing_request.create_encoded collision key) in
+  let multi_request = name_ok "decode multi-valued CSR"
+      (Signing_request.decode_der (Signing_request.encode_der multi_request)) in
+  let multi = decode_cert (Signing_request.sign_encoded multi_request
+      ~valid_from ~valid_until ~serial:"\x06" key name) in
+  check_encoded_name "issuance retains members that legacy sets would merge"
+    collision_der (Certificate.subject_encoded multi);
+  let explicit = decode_cert (Signing_request.sign_encoded request
+      ~valid_from ~valid_until ~serial:"\x07" ~subject:collision key name) in
+  check_encoded_name "sign_encoded accepts a lossless subject override"
+    collision_der (Certificate.subject_encoded explicit);
+  let fresh = name_ok "create legacy CSR" (Signing_request.create legacy key) in
+  let fresh = name_ok "decode legacy CSR"
+      (Signing_request.decode_der (Signing_request.encode_der fresh)) in
+  check_encoded_name "legacy create still uses UTF8" utf8_name_der
+    (Signing_request.subject_encoded fresh);
+  let alias = Distinguished_name.[Relative_distinguished_name.singleton
+      (Other (Asn.OID.(base 2 5 <| 4 <| 3), "Test"))] in
+  let alias_request = name_ok "create legacy alias CSR"
+      (Signing_request.create alias key) in
+  Alcotest.check check_dn "fresh CSR preserves the supplied legacy view"
+    alias (Signing_request.info alias_request).subject;
+  let alias_leaf = name_ok "sign legacy alias CSR"
+      (Signing_request.sign_certificate alias_request ~valid_from ~valid_until
+         ~serial:"\x08" key ca) in
+  Alcotest.check check_dn "fresh certificate preserves the supplied legacy view"
+    alias (Certificate.subject alias_leaf);
+  (* Decode the minimal unsigned OCSP request structurally, independently of
+     X509's private CertID codec. Each single-field SEQUENCE is represented by
+     a singleton list here; there are no optional fields in this request. *)
+  let cert_id = Asn.S.(sequence4
+      (required (sequence2 (required oid) (optional null)))
+      (required octet_string) (required octet_string) (required integer)) in
+  let request_codec = Asn.(codec der S.(
+      sequence_of (sequence_of (sequence_of (sequence_of cert_id))))) in
+  let ocsp = name_ok "create OCSP request"
+      (OCSP.Request.create [OCSP.create_cert_id ca "\x02"]) in
+  match Asn.decode request_codec (OCSP.Request.encode_der ocsp) with
+  | Ok ([[[[(_, name_hash, _, _)]]]], "") ->
+    let hash s = Digestif.SHA1.(to_raw_string (digest_string s)) in
+    Alcotest.(check string "OCSP hashes literal retained issuer Name DER"
+                (hash printable_name_der) name_hash);
+    Alcotest.(check bool "OCSP does not hash the lossy UTF8 view" false
+                (String.equal (hash utf8_name_der) name_hash))
+  | _ -> Alcotest.fail "unexpected minimal OCSP request"
+
 let regression_tests = [
+  "lossless name codec and legacy view", `Quick, test_encoded_name ;
+  "lossless name issuance and OCSP hash", `Quick, test_encoded_name_issuance ;
   "RSA: key too small (jc_jc)", `Quick, test_jc_jc ;
   "jc_ca", `Quick, test_jc_ca_fail ;
   "jc_ca", `Quick, test_jc_ca_all_hashes ;

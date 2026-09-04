@@ -319,12 +319,44 @@ module Distinguished_name : sig
       [CN x], [None] otherwise. *)
   val common_name : t -> string option
 
-  (** [decode_der cs] is [dn], the ASN.1 decoded distinguished name of [cs]. *)
+  (** [decode_der cs] is [dn], the ASN.1 decoded distinguished name of [cs].
+      This is lossy: string tags are discarded and equal attributes in an RDN
+      are merged. Use {!Encoded} when a name must be re-encoded faithfully. *)
   val decode_der : string -> (t, [> `Msg of string ]) result
 
   (** [encode_der dn] is [octets], the ASN.1 encoded representation of the
-      distinguished name [dn]. *)
+      distinguished name [dn], using the default string encodings. *)
   val encode_der : t -> string
+
+  (** A lossless representation of the supported ASN.1 Name syntax, separate
+      from the legacy untagged attributes. It retains RDN members, OIDs, string
+      tags and content octets. DER SET OF members are sorted on encoding.
+
+      Supported values are UTF8String, PrintableString, IA5String,
+      UniversalString, TeletexString and BMPString. No Unicode transcoding or
+      support for arbitrary ASN.1 ANY values is provided. *)
+  module Encoded : sig
+    type legacy = t
+    type t
+
+    (** [decode_der octets] decodes one complete DER Name. *)
+    val decode_der : string -> (t, [> `Msg of string ]) result
+
+    (** [encode_der name] encodes the retained structure as DER. *)
+    val encode_der : t -> string
+
+    (** [to_legacy_lossy name] discards string tags and merges RDN members that
+        become equal under the legacy attribute comparison. Content octets are
+        not converted to UTF-8. This is a view, not a round-trip conversion. *)
+    val to_legacy_lossy : t -> legacy
+
+    (** [of_legacy name] creates a fresh encoded name, using IA5String for DC
+        and Mail, PrintableString for C, Serialnumber and DNQ, and UTF8String
+        for all other attributes. It cannot recover discarded encoding data.
+        The supplied legacy view is retained in fresh objects; an [Other] using
+        a known OID is not normalized until its DER is decoded. *)
+    val of_legacy : legacy -> t
+  end
 end
 
 (** A list of [general_name]s is the value of both
@@ -563,13 +595,19 @@ module Certificate : sig
       specified [hash] algorithm *)
   val fingerprint : Digestif.hash' -> t -> string
 
-  (** [subject certificate] is [dn], the subject as distinguished name of
-      the [certificate]. *)
+  (** [subject certificate] is the lossy legacy view of the subject.
+      Use {!subject_encoded} when retaining its encoding matters. *)
   val subject : t -> Distinguished_name.t
 
-  (** [issuer certificate] is [dn], the issuer as distinguished name of
-      the [certificate]. *)
+  (** [issuer certificate] is the lossy legacy view of the issuer.
+      Use {!issuer_encoded} when retaining its encoding matters. *)
   val issuer : t -> Distinguished_name.t
+
+  (** [subject_encoded certificate] retains the subject's ASN.1 name encoding. *)
+  val subject_encoded : t -> Distinguished_name.Encoded.t
+
+  (** [issuer_encoded certificate] retains the issuer's ASN.1 name encoding. *)
+  val issuer_encoded : t -> Distinguished_name.Encoded.t
 
   (** [serial certificate] is [sn], the serial number of the [certificate].
       A serial is a positive number of at most 20 octets. 0 is supported. A
@@ -836,8 +874,12 @@ module Signing_request : sig
   }
 
   (** [info signing_request] is {!request_info}, the information inside the
-      signing_request. *)
+      signing_request. Its subject is a lossy legacy view. *)
   val info : t -> request_info
+
+  (** [subject_encoded signing_request] retains the subject's ASN.1 name
+      encoding, including string tags and all RDN members. *)
+  val subject_encoded : t -> Distinguished_name.Encoded.t
 
   (** [signature_algorithm signing_request] is the algorithm used for the signature. *)
   val signature_algorithm : t ->
@@ -855,6 +897,11 @@ module Signing_request : sig
   val create : Distinguished_name.t -> ?digest:Digestif.hash' ->
     ?extensions:Ext.t -> Private_key.t -> (t, [> `Msg of string ]) result
 
+  (** [create_encoded subject] is like {!create}, but retains the supplied
+      name encoding rather than selecting default string encodings. *)
+  val create_encoded : Distinguished_name.Encoded.t -> ?digest:Digestif.hash' ->
+    ?extensions:Ext.t -> Private_key.t -> (t, [> `Msg of string ]) result
+
   (** {1 Provision a signing request to a certificate} *)
 
   (** [sign_certificate signing_request ~valid_from ~valid_until ~allowed_hashes
@@ -868,7 +915,10 @@ module Signing_request : sig
       addresses. The Public key and subject are taken from the [signing_request]
       unless [subject] is passed, the [extensions] are added to the X.509
       certificate.  The [private] key is used to sign the certificate, the
-      subject of [certificate] is recorded as the issued certificate's issuer. The digest
+      subject of [certificate] is recorded as the issued certificate's issuer,
+      preserving its encoding. With no [subject] override, the CSR subject's
+      encoding is also retained. An explicit legacy [subject] selects fresh
+      default encodings, even if it equals the CSR subject. The digest
       defaults to [`SHA256].  The [serial] defaults to a random value between 1
       and 2^64.  Certificate version is always 3.  Please note that the
       extensions in the [signing_request] are ignored, you can pass them using:
@@ -891,7 +941,10 @@ module Signing_request : sig
       and subject are taken from the [signing_request] unless [subject] is
       passed, the [extensions] are added to the X.509 certificate.  The
       [private] key is used to sign the certificate, the [issuer] is recorded
-      in the certificate.  The digest defaults to [`SHA256].  The [serial]
+      in the certificate using fresh default encodings. With no [subject]
+      override the CSR subject's encoding is retained; an explicit legacy
+      [subject] selects default encodings. Use {!sign_encoded} to retain an
+      issuer's encoding. The digest defaults to [`SHA256].  The [serial]
       defaults to a random value between 1 and 2^64.  Certificate version is
       always 3.  Please note that the extensions in the [signing_request] are
       ignored, you can pass them using:
@@ -905,6 +958,29 @@ module Signing_request : sig
     ?digest:Digestif.hash' -> ?serial:string -> ?extensions:Extension.t ->
     ?subject:Distinguished_name.t ->
     Private_key.t -> Distinguished_name.t ->
+    (Certificate.t, Validation.signature_error) result
+
+  (** [sign_encoded] is like {!sign}, but accepts a lossless issuer and an
+      optional lossless subject override. Omitting [subject] retains the CSR
+      subject; supplying it replaces the whole name, including its encoding.
+      It does not check that the issuer corresponds to the signing key. *)
+  val sign_encoded : t -> valid_from:Ptime.t -> valid_until:Ptime.t ->
+    ?allowed_hashes:Digestif.hash' list ->
+    ?digest:Digestif.hash' -> ?serial:string -> ?extensions:Extension.t ->
+    ?subject:Distinguished_name.Encoded.t ->
+    Private_key.t -> Distinguished_name.Encoded.t ->
+    (Certificate.t, Validation.signature_error) result
+
+  (** [sign_certificate_encoded] is like {!sign_certificate}, but accepts a
+      lossless subject override. The issuer is always the signing certificate's
+      retained subject. Both entry points perform the same validity, key and
+      name-constraint checks. As before, name constraints are checked against
+      the CSR hostnames and the supplied extensions, not a subject override. *)
+  val sign_certificate_encoded : t -> valid_from:Ptime.t -> valid_until:Ptime.t ->
+    ?allowed_hashes:Digestif.hash' list ->
+    ?digest:Digestif.hash' -> ?serial:string -> ?extensions:Extension.t ->
+    ?subject:Distinguished_name.Encoded.t ->
+    Private_key.t -> Certificate.t ->
     (Certificate.t, Validation.signature_error) result
 end
 
@@ -1128,7 +1204,9 @@ module OCSP : sig
   (** type for CertID to distinguish requested certs *)
   type cert_id
 
-  (** [create_cert_id issuer serial] creates cert_id for this serial *)
+  (** [create_cert_id issuer serial] creates cert_id for this serial.
+      The issuer-name hash is computed from the issuer certificate's retained
+      subject Name DER, not from its lossy legacy distinguished-name view. *)
   val create_cert_id : ?hash:[ `MD5 | `SHA1 | `SHA224 | `SHA256 | `SHA384 | `SHA512 ] -> Certificate.t -> string ->
     cert_id
 
