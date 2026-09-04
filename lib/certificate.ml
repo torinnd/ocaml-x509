@@ -5,9 +5,9 @@ type tBSCertificate = {
   version    : [ `V1 | `V2 | `V3 ] ;
   serial     : string ;
   signature  : Algorithm.t ;
-  issuer     : Distinguished_name.t ;
+  issuer     : Distinguished_name.Encoded.t ;
   validity   : Ptime.t * Ptime.t ;
-  subject    : Distinguished_name.t ;
+  subject    : Distinguished_name.Encoded.t ;
   pk_info    : Public_key.t ;
   issuer_id  : string option ;
   subject_id : string option ;
@@ -80,9 +80,9 @@ module Asn = struct
     (optional ~label:"version"       @@ explicit 0 version) (* default v1 *)
     @ (required ~label:"serialNumber"  @@ serial)
     @ (required ~label:"signature"     @@ Algorithm.identifier)
-    @ (required ~label:"issuer"        @@ Distinguished_name.Asn.name)
+    @ (required ~label:"issuer"        @@ Distinguished_name.Encoded.asn)
     @ (required ~label:"validity"      @@ validity)
-    @ (required ~label:"subject"       @@ Distinguished_name.Asn.name)
+    @ (required ~label:"subject"       @@ Distinguished_name.Encoded.asn)
     @ (required ~label:"subjectPKInfo" @@ Public_key.Asn.pk_info_der)
       (* if present, version is v2 or v3 *)
     @ (optional ~label:"issuerUID"     @@ implicit 1 unique_identifier)
@@ -186,10 +186,10 @@ let pp' pp_custom_extensions ppf { asn ; _ } =
   Fmt.pf ppf "X.509 certificate@.version %a@.serial %a@.algorithm %a@.issuer %a@.valid from %a until %a@.subject %a@.extensions %a"
     pp_version tbs.version Ohex.pp tbs.serial
     Fmt.(option ~none:(any "NONE") pp_sigalg) sigalg
-    Distinguished_name.pp tbs.issuer
+    Distinguished_name.pp (Distinguished_name.Encoded.to_distinguished_name tbs.issuer)
     (Ptime.pp_human ~tz_offset_s:0 ()) (fst tbs.validity)
     (Ptime.pp_human ~tz_offset_s:0 ()) (snd tbs.validity)
-    Distinguished_name.pp tbs.subject
+    Distinguished_name.pp (Distinguished_name.Encoded.to_distinguished_name tbs.subject)
     (Extension.pp' pp_custom_extensions) tbs.extensions
 
 let pp = pp' Extension.default_pp_custom_extension
@@ -198,9 +198,13 @@ let fingerprint hash cert =
   let module Hash = (val (Digestif.module_of_hash' hash)) in
   Hash.(to_raw_string (digest_string cert.raw))
 
-let issuer { asn ; _ } = asn.tbs_cert.issuer
+let issuer { asn ; _ } =
+  Distinguished_name.Encoded.to_distinguished_name asn.tbs_cert.issuer
 
-let subject { asn ; _ } = asn.tbs_cert.subject
+let subject_encoded { asn ; _ } = asn.tbs_cert.subject
+
+let subject cert =
+  Distinguished_name.Encoded.to_distinguished_name (subject_encoded cert)
 
 let serial { asn ; _ } = asn.tbs_cert.serial
 
@@ -231,7 +235,8 @@ let extensions { asn = cert ; _ } = cert.tbs_cert.extensions
    Section 6.4.3. *)
 let hostnames { asn = cert ; _ } =
   let subj =
-    match Distinguished_name.common_name cert.tbs_cert.subject with
+    match Distinguished_name.common_name
+        (Distinguished_name.Encoded.to_distinguished_name cert.tbs_cert.subject) with
     | None -> Host.Set.empty
     | Some x ->
       match Host.host x with

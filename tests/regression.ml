@@ -338,7 +338,192 @@ let ec_priv file pub_file () =
     Alcotest.(check string "PEM encoding of EC public key (derived from private key) is identical"
                 pub (Public_key.encode_pem (Private_key.public priv)))
 
+(* Synthetic DER, independent of the library's Name encoder. Only the outer
+   TLV lengths and Ed25519 signatures are constructed here; Name expectations
+   are literal octets. Comparing complete certificates also checks that the
+   retained names were used in the signed TBS, not just the public accessors. *)
+module Lossless_name = struct
+  let get = function
+    | Ok x -> x
+    | Error (`Msg m) -> Alcotest.fail m
+
+  let signed_cert = function
+    | Ok x -> x
+    | Error e -> Alcotest.failf "%a" Validation.pp_signature_error e
+
+  let tlv tag contents =
+    let n = String.length contents in
+    let length =
+      if n < 128 then String.make 1 (Char.chr n)
+      else if n < 256 then "\x81" ^ String.make 1 (Char.chr n)
+      else "\x82" ^ String.init 2 (function
+          | 0 -> Char.chr (n lsr 8)
+          | _ -> Char.chr (n land 255))
+    in
+    String.make 1 (Char.chr tag) ^ length ^ contents
+
+  let algorithm = Ohex.decode "300506032b6570"
+  let ca_name = Ohex.decode "300d310b3009060355040313024341"
+  let ca_utf8 = Ohex.decode "300d310b300906035504030c024341"
+  let leaf_name = Ohex.decode "300f310d300b060355040313044c656166"
+  let leaf_utf8 = Ohex.decode "300f310d300b06035504030c044c656166"
+  let root_name = Ohex.decode "300f310d300b06035504030c04526f6f74"
+  let validity = Ohex.decode
+      "301e170d3235303130313030303030305a170d3330303130313030303030305a"
+
+  let key () =
+    match Mirage_crypto_ec.Ed25519.priv_of_octets ed25519_priv with
+    | Ok k -> `ED25519 k
+    | Error _ -> Alcotest.fail "synthetic Ed25519 key"
+
+  let public_key key = Public_key.encode_der (Private_key.public key)
+
+  let signed key tbs =
+    let signature = get (Private_key.sign `SHA512 ~scheme:`ED25519 key (`Message tbs)) in
+    tlv 0x30 (tbs ^ algorithm ^ tlv 0x03 ("\x00" ^ signature))
+
+  let certificate_der key issuer subject =
+    let tbs = tlv 0x30
+        (Ohex.decode "a003020102020101" ^ algorithm ^ issuer ^ validity ^
+         subject ^ public_key key)
+    in
+    signed key tbs
+
+  let csr key subject =
+    let info = tlv 0x30
+        (Ohex.decode "020100" ^ subject ^ public_key key ^ Ohex.decode "a000")
+    in
+    get (Signing_request.decode_der (signed key info))
+
+  let ca key = get (Certificate.decode_der (certificate_der key root_name ca_name))
+
+  let issue ?subject key ca csr =
+    let valid_from, valid_until = Certificate.validity ca in
+    signed_cert (Signing_request.sign_certificate csr ~valid_from ~valid_until
+                   ~serial:"\x01" ?subject key ca)
+
+  let check_certificate label key issuer subject cert =
+    Alcotest.(check string label
+                (certificate_der key issuer subject) (Certificate.encode_der cert))
+
+  let cn s = Distinguished_name.[Relative_distinguished_name.singleton (CN s)]
+
+  let printable () =
+    let key = key () in
+    let ca = ca key and request = csr key leaf_name in
+    let cert = issue key ca request in
+    check_certificate "CA subject and CSR subject retain PrintableString"
+      key ca_name leaf_name cert;
+    Alcotest.check check_dn "legacy subject accessor" (cn "Leaf") (Certificate.subject cert);
+    Alcotest.check check_dn "legacy CSR info" (cn "Leaf") (Signing_request.info request).subject;
+    (* The projection is intentionally tag-insensitive, including chain name
+       matching: introducing retained encodings must not tighten trust rules. *)
+    Alcotest.check check_dn "legacy issuer equality"
+      (Certificate.subject ca) (Certificate.issuer cert)
+
+  let legacy_and_override () =
+    let key = key () in
+    let ca = ca key and request = csr key leaf_name in
+    let valid_from, valid_until = Certificate.validity ca in
+    Alcotest.(check string "CN construction still defaults to UTF8String"
+                leaf_utf8 (Distinguished_name.encode_der (cn "Leaf")));
+    let fresh = get (Signing_request.create (cn "Leaf") key) in
+    let fresh_cert = signed_cert
+        (Signing_request.sign fresh ~valid_from ~valid_until ~serial:"\x01" key (cn "CA"))
+    in
+    check_certificate "legacy construction" key ca_utf8 leaf_utf8 fresh_cert;
+    let cert = issue ~subject:(Signing_request.info request).subject key ca request in
+    check_certificate "explicit, even equal, subject override uses legacy encoding"
+      key ca_name leaf_utf8 cert;
+    let cert = signed_cert
+        (Signing_request.sign request ~valid_from ~valid_until ~serial:"\x01"
+           key (Certificate.subject ca))
+    in
+    check_certificate "legacy issuer loses provenance, CSR does not"
+      key ca_utf8 leaf_name cert;
+    let other = Distinguished_name.[Relative_distinguished_name.singleton
+        (Other (Asn.OID.(base 2 5 <| 4 <| 3), "Leaf"))]
+    in
+    let fresh = get (Signing_request.create other key) in
+    Alcotest.check check_dn "fresh Other with a known OID is not normalized"
+      other (Signing_request.info fresh).subject;
+    let cert = issue key ca fresh in
+    Alcotest.check check_dn "fresh certificate keeps its supplied public view"
+      other (Certificate.subject cert)
+
+  let equality () =
+    let key = key () in
+    (* V1 trust anchor: issuer UTF8String and subject PrintableString are
+       equal under existing name matching, although their DER differs. *)
+    let tbs = tlv 0x30
+        (Ohex.decode "020101" ^ algorithm ^ ca_utf8 ^ validity ^ ca_name ^ public_key key)
+    in
+    let cert = get (Certificate.decode_der (signed key tbs)) in
+    match Validation.valid_ca cert with
+    | Ok () -> ()
+    | Error e -> Alcotest.failf "%a" Validation.pp_ca_error e
+
+  let supported_strings () =
+    let key = key () in
+    let ca = ca key in
+    List.iter (fun (label, hex) ->
+        let name = Ohex.decode hex in
+        let request = csr key name in
+        check_certificate label key ca_name name (issue key ca request)) [
+      "UTF8String bytes", "300d310b300906035504030c02c3a9";
+      "PrintableString", "300c310a30080603550403130141";
+      "IA5String", "300c310a30080603550403160141";
+      "UniversalString bytes", "300f310d300b06035504031c04000000e9";
+      "TeletexString bytes", "300c310a300806035504031401e9";
+      "BMPString bytes", "300d310b300906035504031e0200e9";
+      (* One RDN with two CNs that collapse to one public attribute, followed
+         by an unknown OID in a second RDN. Neither Set deduplication nor public
+         constructor order should touch the retained representation. *)
+      "RDN grouping and distinct tags",
+      "30243114300806035504030c014130080603550403130141310c300a06032a03041303466f6f"
+    ]
+
+  let ocsp () =
+    let key = key () in
+    let ca = ca key in
+    let id = OCSP.create_cert_id ca "\x01" in
+    let request = get (OCSP.Request.create [id]) in
+    (* SHA1 of the literal [ca_name], not of a projected/re-encoded Name. *)
+    let hash = Ohex.decode "acb0671fd9f377f8b2a767b82e5de5862dbf6177" in
+    let key_hash = Public_key.fingerprint ~hash:`SHA1 (Private_key.public key) in
+    let id = tlv 0x30
+        (Ohex.decode "300906052b0e03021a0500" ^ tlv 0x04 hash ^
+         tlv 0x04 key_hash ^ Ohex.decode "020101")
+    in
+    let expected = tlv 0x30 (tlv 0x30 (tlv 0x30 (tlv 0x30 id))) in
+    Alcotest.(check string "OCSP issuerNameHash hashes literal PrintableString Name"
+                expected (OCSP.Request.encode_der request))
+
+  let crl () =
+    let key = key () in
+    let tbs = tlv 0x30
+        (Ohex.decode "020101" ^ algorithm ^ ca_name ^
+         Ohex.decode "170d3235303130313030303030305a")
+    in
+    let crl = get (CRL.decode_der (signed key tbs)) in
+    let this_update = CRL.this_update crl in
+    let updated = get (CRL.revoke_certificates [] ~this_update crl key) in
+    (* With no previous CRLNumber, revoke_certificates starts at zero. *)
+    let expected_tbs = tlv 0x30
+        (Ohex.decode "020101" ^ algorithm ^ ca_name ^
+         Ohex.decode "170d3235303130313030303030305aa00e300c300a0603551d140403020100")
+    in
+    Alcotest.(check string "updating a CRL retains its issuer"
+                (signed key expected_tbs) (CRL.encode_der updated))
+end
+
 let regression_tests = [
+  "lossless PrintableString issuance", `Quick, Lossless_name.printable ;
+  "legacy names and subject override", `Quick, Lossless_name.legacy_and_override ;
+  "legacy name equality", `Quick, Lossless_name.equality ;
+  "retained string bytes and RDNs", `Quick, Lossless_name.supported_strings ;
+  "retained OCSP issuer name hash", `Quick, Lossless_name.ocsp ;
+  "retained CRL issuer", `Quick, Lossless_name.crl ;
   "RSA: key too small (jc_jc)", `Quick, test_jc_jc ;
   "jc_ca", `Quick, test_jc_ca_fail ;
   "jc_ca", `Quick, test_jc_ca_all_hashes ;

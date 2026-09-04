@@ -35,8 +35,14 @@ type request_info = {
   extensions : Ext.t ;
 }
 
+type encoded_request_info = {
+  encoded_subject : Distinguished_name.Encoded.t ;
+  public_key : Public_key.t ;
+  extensions : Ext.t ;
+}
+
 type request = {
-  info : request_info ;
+  info : encoded_request_info ;
   signature_algorithm : Algorithm.t ;
   signature : string
 }
@@ -71,7 +77,7 @@ module Asn = struct
                     Extension.Asn.extensions_der)))
   let request_info =
     let f = function
-      | (0, subject, public_key, extensions) ->
+      | (0, encoded_subject, public_key, extensions) ->
         let extensions =
           List.fold_left (fun map (Ext.B (k, v)) ->
               match Ext.add_unless_bound k v map with
@@ -80,17 +86,17 @@ module Asn = struct
               | Some b -> b)
         Ext.empty extensions
         in
-        { subject ; public_key ; extensions }
+        { encoded_subject ; public_key ; extensions }
       | _ ->
         parse_error "unknown certificate request info"
-    and g { subject ; public_key ; extensions } =
+    and g { encoded_subject ; public_key ; extensions } =
       let extensions = Ext.bindings extensions in
-      (0, subject, public_key, extensions)
+      (0, encoded_subject, public_key, extensions)
     in
     map f g @@
     sequence4
       (required ~label:"version" int)
-      (required ~label:"subject" Distinguished_name.Asn.name)
+      (required ~label:"subject" Distinguished_name.Encoded.asn)
       (required ~label:"subjectPKInfo" Public_key.Asn.pk_info_der)
       (required ~label:"attributes" @@ implicit 0 (set_of attributes))
 
@@ -113,7 +119,10 @@ module Asn = struct
     projections_of Asn.der signing_request
 end
 
-let info { asn ; _ } = asn.info
+let info { asn ; _ } : request_info =
+  let { encoded_subject ; public_key ; extensions } = asn.info in
+  { subject = Distinguished_name.Encoded.to_distinguished_name encoded_subject ;
+    public_key ; extensions }
 
 let signature_algorithm { asn ; _ } =
   Algorithm.to_signature_algorithm asn.signature_algorithm
@@ -136,7 +145,9 @@ let hostnames csr =
 
 let validate_signature allowed_hashes { asn ; raw } =
   let raw_data = Validation.raw_cert_hack raw in
-  Validation.validate_raw_signature asn.info.subject allowed_hashes raw_data
+  Validation.validate_raw_signature
+    (Distinguished_name.Encoded.to_distinguished_name asn.info.encoded_subject)
+    allowed_hashes raw_data
     asn.signature_algorithm asn.signature asn.info.public_key
 
 let decode_der ?(allowed_hashes = Validation.sha2) cs =
@@ -175,7 +186,8 @@ let default_digest digest key =
 let create subject ?digest ?(extensions = Ext.empty) (key : Private_key.t) =
   let hash = default_digest digest key in
   let public_key = Private_key.public key in
-  let info : request_info = { subject ; public_key ; extensions } in
+  let encoded_subject = Distinguished_name.Encoded.of_distinguished_name subject in
+  let info = { encoded_subject ; public_key ; extensions } in
   let info_str = Asn.request_info_to_str info in
   let scheme = Key_type.x509_default_scheme (Private_key.key_type key) in
   let* signature = Private_key.sign hash ~scheme key (`Message info_str) in
@@ -184,14 +196,20 @@ let create subject ?digest ?(extensions = Ext.empty) (key : Private_key.t) =
   let raw = Asn.signing_request_to_str asn in
   Ok { asn ; raw }
 
-let sign signing_request
+(* The common signing path receives an encoded issuer. Public [sign] converts
+   its legacy issuer below; [sign_certificate] can retain the CA's subject. *)
+let sign_encoded signing_request
     ~valid_from ~valid_until
     ?(allowed_hashes = Validation.sha2)
     ?digest
     ?serial
     ?(extensions = Extension.empty)
-    ?(subject = signing_request.asn.info.subject)
+    ?subject
     key issuer =
+  let subject = match subject with
+    | None -> signing_request.asn.info.encoded_subject
+    | Some name -> Distinguished_name.Encoded.of_distinguished_name name
+  in
   let hash = default_digest digest key in
   let serial = match serial with
     | Some s -> s
@@ -238,6 +256,12 @@ let sign signing_request
   let raw = Certificate.Asn.certificate_to_octets asn in
   Ok { Certificate.asn ; raw }
 
+let sign signing_request ~valid_from ~valid_until ?allowed_hashes ?digest ?serial
+    ?extensions ?subject key issuer =
+  sign_encoded signing_request ~valid_from ~valid_until ?allowed_hashes ?digest
+    ?serial ?extensions ?subject key
+    (Distinguished_name.Encoded.of_distinguished_name issuer)
+
 let sign_certificate signing_request
     ~valid_from ~valid_until
     ?allowed_hashes
@@ -272,5 +296,5 @@ let sign_certificate signing_request
     in
     Validation.validate_name_constraints hosts ips certificate
   in
-  sign signing_request ~valid_from ~valid_until ?allowed_hashes ?digest ?serial
-    ~extensions ?subject key (Certificate.subject certificate)
+  sign_encoded signing_request ~valid_from ~valid_until ?allowed_hashes ?digest ?serial
+    ~extensions ?subject key (Certificate.subject_encoded certificate)

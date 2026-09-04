@@ -319,11 +319,14 @@ module Distinguished_name : sig
       [CN x], [None] otherwise. *)
   val common_name : t -> string option
 
-  (** [decode_der cs] is [dn], the ASN.1 decoded distinguished name of [cs]. *)
+  (** [decode_der cs] is [dn], the ASN.1 decoded distinguished name of [cs].
+      This is a lossy projection: string tags and attributes which collapse in
+      an RDN set are not retained. *)
   val decode_der : string -> (t, [> `Msg of string ]) result
 
   (** [encode_der dn] is [octets], the ASN.1 encoded representation of the
-      distinguished name [dn]. *)
+      distinguished name [dn], using the legacy string choices (for example,
+      [CN] uses UTF8String). This need not reproduce the input to [decode_der]. *)
   val encode_der : t -> string
 end
 
@@ -564,11 +567,11 @@ module Certificate : sig
   val fingerprint : Digestif.hash' -> t -> string
 
   (** [subject certificate] is [dn], the subject as distinguished name of
-      the [certificate]. *)
+      the [certificate]. This projection does not retain ASN.1 string tags. *)
   val subject : t -> Distinguished_name.t
 
   (** [issuer certificate] is [dn], the issuer as distinguished name of
-      the [certificate]. *)
+      the [certificate]. This projection does not retain ASN.1 string tags. *)
   val issuer : t -> Distinguished_name.t
 
   (** [serial certificate] is [sn], the serial number of the [certificate].
@@ -827,7 +830,7 @@ module Signing_request : sig
     val pp : t Fmt.t
   end
 
-  (** The raw request info of a
+  (** The public request info of a
       {{:https://tools.ietf.org/html/rfc2986#section-4}PKCS 10 certification request info}. *)
   type request_info = {
     subject    : Distinguished_name.t ;
@@ -836,7 +839,8 @@ module Signing_request : sig
   }
 
   (** [info signing_request] is {!request_info}, the information inside the
-      signing_request. *)
+      signing_request. The subject is a lossy projection; signing without a
+      subject override uses the internally retained Name instead. *)
   val info : t -> request_info
 
   (** [signature_algorithm signing_request] is the algorithm used for the signature. *)
@@ -868,7 +872,10 @@ module Signing_request : sig
       addresses. The Public key and subject are taken from the [signing_request]
       unless [subject] is passed, the [extensions] are added to the X.509
       certificate.  The [private] key is used to sign the certificate, the
-      subject of [certificate] is recorded as the issued certificate's issuer. The digest
+      subject of [certificate] is recorded as the issued certificate's issuer.
+      The supported ASN.1 string tags and content octets of both names are
+      retained. An explicit [subject] uses the legacy public encoding, even if
+      equal to the request's public subject. The digest
       defaults to [`SHA256].  The [serial] defaults to a random value between 1
       and 2^64.  Certificate version is always 3.  Please note that the
       extensions in the [signing_request] are ignored, you can pass them using:
@@ -891,7 +898,11 @@ module Signing_request : sig
       and subject are taken from the [signing_request] unless [subject] is
       passed, the [extensions] are added to the X.509 certificate.  The
       [private] key is used to sign the certificate, the [issuer] is recorded
-      in the certificate.  The digest defaults to [`SHA256].  The [serial]
+      in the certificate using the legacy public encoding: any original ASN.1
+      string tags have already been lost. Use [sign_certificate] to retain the
+      issuing certificate's subject encoding. Without a [subject] override,
+      the request's subject encoding is retained. The digest defaults to
+      [`SHA256]. The [serial]
       defaults to a random value between 1 and 2^64.  Certificate version is
       always 3.  Please note that the extensions in the [signing_request] are
       ignored, you can pass them using:

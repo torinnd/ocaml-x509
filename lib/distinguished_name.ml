@@ -159,6 +159,22 @@ let common_name t =
       | Some CN x -> Some x | _ -> acc)
     None t
 
+type encoded_value = [
+  | `C1 of string (* UTF8String *)
+  | `C2 of string (* PrintableString *)
+  | `C3 of string (* IA5String *)
+  | `C4 of string (* UniversalString *)
+  | `C5 of string (* TeletexString *)
+  | `C6 of string (* BMPString *)
+]
+
+type encoded = (Asn.oid * encoded_value) list list
+
+type retained = {
+  encoding : encoded ;
+  name : t ;
+}
+
 module Asn = struct
   open Asn.S
   open Asn_grammars
@@ -175,17 +191,12 @@ module Asn = struct
       utf8_string printable_string
       ia5_string universal_string teletex_string bmp_string
 
-  (* We flatten the sequence-of-set-of-tuple here into a single list.
-  * This means that we can't write non-singleton sets back.
-  * Does anyone need that, ever?
-  *)
-
-  let name =
+  let attribute_of_pair =
     let open Registry in
     let of_c = function
       | `C1 x | `C2 x | `C3 x | `C4 x | `C5 x | `C6 x -> x in
 
-    let a_f = case_of_oid_f [
+    case_of_oid_f [
       (domain_component              , fun x -> DC (of_c x)) ;
       (X520.common_name              , fun x -> CN (of_c x)) ;
       (X520.serial_number            , fun x -> Serialnumber (of_c x)) ;
@@ -206,7 +217,9 @@ module Asn = struct
       (userid                        , fun x -> Userid (of_c x))]
       ~default:(fun oid x -> Other (oid, of_c x))
 
-    and a_g = function
+  let attribute_to_pair =
+    let open Registry in
+    function
       | DC x -> (domain_component, `C3 x )
       | CN x -> (X520.common_name, `C1 x )
       | Serialnumber x -> (X520.serial_number, `C2 x )
@@ -226,28 +239,57 @@ module Asn = struct
       | Street x -> (X520.street_address, `C1 x )
       | Userid x -> (userid, `C1 x )
       | Other (oid, x) -> (oid, `C1 x )
-    in
 
+  (* Do not project to the public Set here: it forgets string tags, ordering,
+     and attributes which differ only in their string tag. The string codecs
+     carry their content octets; no Unicode conversion is performed. *)
+  let encoded_name : encoded Asn.t =
     let attribute_tv =
-      map a_f a_g @@
       sequence2
-        (required ~label:"attr type"  oid)
-        (* This is ANY according to rfc5280. *)
+        (required ~label:"attr type" oid)
+        (* This is ANY according to rfc5280; only the six strings above are
+           supported, as in the public codec. *)
         (required ~label:"attr value" directory_name)
     in
-    let rd_name =
-      let f exts =
-        List.fold_left
-          (fun set attr -> Relative_distinguished_name.add attr set)
-          Relative_distinguished_name.empty exts
-      and g map = Relative_distinguished_name.elements map
-      in
-      map f g @@ set_of attribute_tv
-    in
-    sequence_of rd_name (* A vacuous choice, in the standard. *)
+    sequence_of (set_of attribute_tv)
+
+  let to_name =
+    List.map (fun attrs ->
+        List.fold_left (fun set attr ->
+            Relative_distinguished_name.add (attribute_of_pair attr) set)
+          Relative_distinguished_name.empty attrs)
+
+  let of_name =
+    List.map (fun rdn ->
+        List.map attribute_to_pair (Relative_distinguished_name.elements rdn))
+
+  let name = map to_name of_name encoded_name
+
+  let retained_name =
+    map (fun encoding -> { encoding ; name = to_name encoding })
+      (fun { encoding ; _ } -> encoding) encoded_name
+
+  let (_, retained_name_to_octets) =
+    projections_of Asn.der retained_name
 
   let (name_of_octets, name_to_octets) =
     projections_of Asn.der name
+end
+
+(* Private to the library: deliberately absent from X509.Distinguished_name.
+   Keep this representation with parsed objects, not in a cache keyed by the
+   lossy public name. DER SET OF canonicalization belongs to the ASN.1 codec. *)
+module Encoded = struct
+  type t = retained
+
+  let asn = Asn.retained_name
+
+  (* Keep the supplied public view, rather than decoding our own encoding:
+     Other (known_oid, x) must not silently become CN x etc. in fresh objects.
+     Parsed names use exactly the legacy projection in [retained_name]. *)
+  let of_distinguished_name name = { encoding = Asn.of_name name ; name }
+  let to_distinguished_name { name ; _ } = name
+  let encode_der = Asn.retained_name_to_octets
 end
 
 let decode_der cs = Asn_grammars.err_to_msg (Asn.name_of_octets cs)

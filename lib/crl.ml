@@ -7,7 +7,7 @@ type revoked_cert = {
 type tBS_CRL = {
   version : [ `V1 | `V2 ] ;
   signature : Algorithm.t ;
-  issuer : Distinguished_name.t ;
+  issuer : Distinguished_name.Encoded.t ;
   this_update : Ptime.t ;
   next_update : Ptime.t option ;
   revoked_certs : revoked_cert list ;
@@ -62,7 +62,7 @@ module Asn = struct
     sequence @@
     (optional ~label:"version" @@ version)
     @ (required ~label:"signature" @@ Algorithm.identifier)
-    @ (required ~label:"issuer" @@ Distinguished_name.Asn.name)
+    @ (required ~label:"issuer" @@ Distinguished_name.Encoded.asn)
     @ (required ~label:"thisUpdate" @@ Certificate.Asn.time)
     @ (optional ~label:"nextUpdate" @@ Certificate.Asn.time)
     @ (optional ~label:"revokedCertificates" @@ sequence_of revokedCertificate)
@@ -105,7 +105,8 @@ let decode_der raw =
 
 let encode_der { raw ; _ } = raw
 
-let issuer { asn ; _ } = asn.tbs_crl.issuer
+let issuer { asn ; _ } =
+  Distinguished_name.Encoded.to_distinguished_name asn.tbs_crl.issuer
 
 let this_update { asn ; _ } = asn.tbs_crl.this_update
 
@@ -125,7 +126,9 @@ let signature_algorithm { asn ; _ } =
 
 let validate { raw ; asn } ?(allowed_hashes = Validation.sha2) pub =
   let tbs_raw = Validation.raw_cert_hack raw in
-  Validation.validate_raw_signature asn.tbs_crl.issuer allowed_hashes
+  Validation.validate_raw_signature
+    (Distinguished_name.Encoded.to_distinguished_name asn.tbs_crl.issuer)
+    allowed_hashes
     tbs_raw asn.signature_algo asn.signature_val pub
 
 type verification_error = [
@@ -155,8 +158,8 @@ let verify ({ asn ; _ } as crl) ?allowed_hashes ?time cert =
   let subj = Certificate.subject cert in
   let* () =
     guard
-      (Distinguished_name.equal asn.tbs_crl.issuer subj)
-      (`Issuer_subject_mismatch (asn.tbs_crl.issuer, subj))
+      (Distinguished_name.equal (issuer crl) subj)
+      (`Issuer_subject_mismatch (issuer crl, subj))
   in
   let* () =
     match time with
@@ -227,7 +230,7 @@ let revoke
   let tbs_crl = {
     version = `V2 ;
     signature ;
-    issuer ;
+    issuer = Distinguished_name.Encoded.of_distinguished_name issuer ;
     this_update ; next_update ;
     revoked_certs ;
     extensions
