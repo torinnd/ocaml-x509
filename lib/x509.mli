@@ -242,38 +242,79 @@ end
 (** X.500 distinguished name *)
 module Distinguished_name : sig
 
-  (** The variant of a relative distinguished name component, as defined in
-    X.500: an attribute type and value. *)
-  type attribute =
-    | CN of string
-    | Serialnumber of string
-    | C of string
-    | L of string
-    | ST of string
-    | O of string
-    | OU of string
-    | T of string
-    | DNQ of string
-    | Mail of string
-    | DC of string
-    | Given_name of string
-    | Surname of string
-    | Initials of string
-    | Pseudonym of string
-    | Generation of string
-    | Street of string
-    | Userid of string
-    | Other of Asn.oid * string
+  (** Raw string contents and an ASN.1 string tag. This includes IA5String,
+      which the existing parser accepts, but which is not a DirectoryString
+      alternative. No Unicode interpretation is provided. *)
+  module Encoded_string : sig
+    type encoding = [ `UTF8 | `Printable | `IA5 | `Universal | `Teletex | `BMP ]
 
-  (** Relative_distinguished_name is a set of attributes. *)
+    type t
+
+    (** [of_octets ~encoding octets] labels raw content octets (without a tag
+        or length). The default tag is UTF8String. This is unchecked: it does
+        not validate a character repertoire, length, or attribute schema, and
+        does not transcode. For example, BMPString containing A needs
+        [of_octets ~encoding:`BMP "\000A"], not ["A"].
+
+        Parsed values retain the tag and contents accepted by the ASN.1
+        decoder; they do not acquire any additional text validation. *)
+    val of_octets : ?encoding:encoding -> string -> t
+
+    (** The original content octets, not necessarily UTF-8 text. *)
+    val to_octets : t -> string
+
+    val encoding : t -> encoding
+  end
+
+  (** The variant of a relative distinguished name component, as defined in
+    X.500: an attribute type and value. All values carry a tag, including
+    fixed-schema attributes, so permissively parsed tags are not lost.
+    For new names, explicitly select PrintableString for [C], [Serialnumber],
+    and [DNQ], and IA5String for [Mail] and [DC]; the other named attributes
+    can use the UTF8String default. Schema restrictions are not enforced.
+    [Other] supports only the six string tags, not arbitrary ASN.1 values. *)
+  type attribute =
+    | CN of Encoded_string.t
+    | Serialnumber of Encoded_string.t
+    | C of Encoded_string.t
+    | L of Encoded_string.t
+    | ST of Encoded_string.t
+    | O of Encoded_string.t
+    | OU of Encoded_string.t
+    | T of Encoded_string.t
+    | DNQ of Encoded_string.t
+    | Mail of Encoded_string.t
+    | DC of Encoded_string.t
+    | Given_name of Encoded_string.t
+    | Surname of Encoded_string.t
+    | Initials of Encoded_string.t
+    | Pseudonym of Encoded_string.t
+    | Generation of Encoded_string.t
+    | Street of Encoded_string.t
+    | Userid of Encoded_string.t
+    | Other of Asn.oid * Encoded_string.t
+
+  (** A set of attributes ordered by constructor (and OID for [Other]), then
+      content octets, then tag. Attributes with different tags remain distinct.
+      Set operations use this representation ordering, not {!equal} below.
+      Identical attributes are still deduplicated. *)
   module Relative_distinguished_name : Set.S with type elt = attribute
 
   (** A distinguished name is a list of relative distinguished names, starting
       with the most significant component. *)
   type t = Relative_distinguished_name.t list
 
-  (** [equal a b] is [true] if the distinguished names [a] and [b] are equal. *)
+  (** [equal a b] preserves the legacy matching rule: ordered RDNs, each a
+      set of attributes compared by constructor/OID and raw content octets,
+      ignoring tags. Tag-only duplicates are collapsed for matching. No
+      transcoding, case folding, or Unicode normalization is performed. *)
   val equal : t -> t -> bool
+
+  (** Compare the stored representation, including string tags. Unlike
+      {!equal}, this distinguishes PrintableString from UTF8String even when
+      their content octets agree. This is not a comparison of original DER:
+      sets discard identical duplicates, and [Other] aliases are not resolved. *)
+  val equal_representation : t -> t -> bool
 
   (** [make_pp ()] creates a customized pretty-printer for {!t}.
 
@@ -303,7 +344,8 @@ module Distinguished_name : sig
 
       The pretty-printer can be wrapped in a box to control line breaking and
       set it apart, otherwise the RDN components will flow with the surrounding
-      text. *)
+      text. This is a diagnostic byte-oriented printer: string contents are
+      not transcoded, and tags are not shown. It is not a lossless text format. *)
   val make_pp :
     format: [`RFC4514 | `OpenSSL | `OSF] ->
     ?spacing: [`Tight | `Medium | `Loose] ->
@@ -317,13 +359,16 @@ module Distinguished_name : sig
 
   (** [common_name t] is [Some x] if the distinguished name [t] contains a
       [CN x], [None] otherwise. *)
-  val common_name : t -> string option
+  val common_name : t -> Encoded_string.t option
 
   (** [decode_der cs] is [dn], the ASN.1 decoded distinguished name of [cs]. *)
   val decode_der : string -> (t, [> `Msg of string ]) result
 
   (** [encode_der dn] is [octets], the ASN.1 encoded representation of the
-      distinguished name [dn]. *)
+      distinguished name [dn]. Each stored string retains its tag and content
+      octets; no schema-based tag replacement is performed. This does not
+      promise byte-for-byte preservation of every input Name: identical
+      attributes in an RDN are deduplicated and SET OF is DER-ordered. *)
   val encode_der : t -> string
 end
 

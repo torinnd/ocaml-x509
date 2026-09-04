@@ -36,7 +36,9 @@ let key () =
 
 let selfsigned ?(name = "test") now =
   let pub, priv = key () in
-  let name = [ Distinguished_name.(Relative_distinguished_name.singleton (CN name)) ] in
+  let name =
+    [ Distinguished_name.(Relative_distinguished_name.singleton
+                            (CN (Encoded_string.of_octets name))) ] in
   match Signing_request.create name priv with
   | Error _ -> assert false
   | Ok req ->
@@ -47,7 +49,9 @@ let selfsigned ?(name = "test") now =
 
 let cert ?serial ?(name = "sub") now ca pubca privca issuer =
   let pub, priv = key () in
-  let name = [ Distinguished_name.(Relative_distinguished_name.singleton (CN name)) ] in
+  let name =
+    [ Distinguished_name.(Relative_distinguished_name.singleton
+                            (CN (Encoded_string.of_octets name))) ] in
   match Signing_request.create name priv with
   | Error _ -> assert false
   | Ok req ->
@@ -73,7 +77,8 @@ let sign_with_intermediate () =
   in
   let _, leaf_priv = key () in
   let name =
-    [ Distinguished_name.(Relative_distinguished_name.singleton (CN "leaf")) ]
+    [ Distinguished_name.(Relative_distinguished_name.singleton
+                            (CN (Encoded_string.of_octets "leaf"))) ]
   in
   let req = match Signing_request.create name leaf_priv with
     | Ok req -> req

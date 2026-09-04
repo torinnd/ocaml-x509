@@ -75,14 +75,14 @@ let test_distinguished_name () =
   let open Distinguished_name in
   let crt = cert "PostaCARoot" in
   let expected = [
-    Relative_distinguished_name.singleton (DC "rs") ;
-    Relative_distinguished_name.singleton (DC "posta") ;
-    Relative_distinguished_name.singleton (DC "ca") ;
-    Relative_distinguished_name.singleton (CN "Configuration") ;
-    Relative_distinguished_name.singleton (CN "Services") ;
-    Relative_distinguished_name.singleton (CN "Public Key Services") ;
-    Relative_distinguished_name.singleton (CN "AIA") ;
-    Relative_distinguished_name.singleton (CN "Posta CA Root")
+    Relative_distinguished_name.singleton (DC (Encoded_string.of_octets ~encoding:`IA5 "rs")) ;
+    Relative_distinguished_name.singleton (DC (Encoded_string.of_octets ~encoding:`IA5 "posta")) ;
+    Relative_distinguished_name.singleton (DC (Encoded_string.of_octets ~encoding:`IA5 "ca")) ;
+    Relative_distinguished_name.singleton (CN (Encoded_string.of_octets "Configuration")) ;
+    Relative_distinguished_name.singleton (CN (Encoded_string.of_octets "Services")) ;
+    Relative_distinguished_name.singleton (CN (Encoded_string.of_octets "Public Key Services")) ;
+    Relative_distinguished_name.singleton (CN (Encoded_string.of_octets "AIA")) ;
+    Relative_distinguished_name.singleton (CN (Encoded_string.of_octets "Posta CA Root"))
   ] in
   Alcotest.(check check_dn "complex issuer is good"
               expected (Certificate.issuer crt)) ;
@@ -92,9 +92,10 @@ let test_distinguished_name () =
 let test_distinguished_name_pp () =
   let module Dn = struct
     include Distinguished_name
-    let cn s = Relative_distinguished_name.singleton (CN s)
-    let o s = Relative_distinguished_name.singleton (O s)
-    let initials s = Relative_distinguished_name.singleton (Initials s)
+    let cn s = Relative_distinguished_name.singleton (CN (Encoded_string.of_octets s))
+    let o s = Relative_distinguished_name.singleton (O (Encoded_string.of_octets s))
+    let initials s =
+      Relative_distinguished_name.singleton (Initials (Encoded_string.of_octets s))
     let (+) = Relative_distinguished_name.union
   end in
   let dn1 = "DN1", Dn.[o "Blanc";
@@ -119,6 +120,225 @@ let test_distinguished_name_pp () =
   check pp4 dn1 {|/O=Blanc/CN=John Doe+Initials=J.D.+Initials=N.N.|} ;
   check pp4 dn2 {|/O=\ Escapist/CN=\# 2/CN=\ \"\+,;\/\<\>\\ \ |} ;
   check pp5 dn1 "CN=John Doe+\nInitials=J.D.+\nInitials=N.N.,\nO=Blanc"
+
+let decode_name der =
+  match Distinguished_name.decode_der der with
+  | Ok dn -> dn
+  | Error (`Msg msg) -> Alcotest.failf "name decoding error: %s" msg
+
+let test_encoded_name_roundtrip () =
+  let open Distinguished_name in
+  (* These are content octets, not text passed through a tag-specific encoder.
+     In particular, A is two bytes in BMPString and four in UniversalString. *)
+  List.iter (fun (encoding, octets, hex) ->
+      let der = Ohex.decode hex in
+      let dn = decode_name der in
+      Alcotest.(check string "name DER" der (encode_der dn)) ;
+      match common_name dn with
+      | None -> Alcotest.fail "missing CN"
+      | Some value ->
+        Alcotest.(check string "CN content octets" octets
+                    (Encoded_string.to_octets value)) ;
+        Alcotest.(check bool "CN tag" true
+                    (encoding = Encoded_string.encoding value)))
+    [ `UTF8, "A", "300c310a300806035504030c0141" ;
+      `UTF8, "\xc3\xa9", "300d310b300906035504030c02c3a9" ;
+      `Printable, "A", "300c310a30080603550403130141" ;
+      `IA5, "A", "300c310a30080603550403160141" ;
+      `Teletex, "A", "300c310a30080603550403140141" ;
+      `Universal, "\x00\x00\x00A", "300f310d300b06035504031c0400000041" ;
+      `BMP, "\x00A", "300d310b300906035504031e020041" ] ;
+  let fresh = [Relative_distinguished_name.singleton
+                 (CN (Encoded_string.of_octets "A"))] in
+  Alcotest.(check string "fresh CN defaults to UTF8String"
+              (Ohex.decode "300c310a300806035504030c0141") (encode_der fresh))
+
+(* A short-form DER fixture builder, independent of the library encoder. *)
+let short_tlv tag contents =
+  let len = String.length contents in
+  assert (len < 128) ;
+  String.make 1 (Char.chr tag) ^ String.make 1 (Char.chr len) ^ contents
+
+let test_all_attribute_tags () =
+  let open Distinguished_name in
+  let other_oid = Asn.OID.(base 1 2 <| 3 <| 4) in
+  let attributes = [
+    (fun x -> CN x), "550403" ;
+    (fun x -> Serialnumber x), "550405" ;
+    (fun x -> C x), "550406" ;
+    (fun x -> L x), "550407" ;
+    (fun x -> ST x), "550408" ;
+    (fun x -> O x), "55040a" ;
+    (fun x -> OU x), "55040b" ;
+    (fun x -> T x), "55040c" ;
+    (fun x -> DNQ x), "55042e" ;
+    (fun x -> Mail x), "2a864886f70d010901" ;
+    (fun x -> DC x), "0992268993f22c640119" ;
+    (fun x -> Given_name x), "55042a" ;
+    (fun x -> Surname x), "550404" ;
+    (fun x -> Initials x), "55042b" ;
+    (fun x -> Pseudonym x), "550441" ;
+    (fun x -> Generation x), "55042c" ;
+    (fun x -> Street x), "550409" ;
+    (fun x -> Userid x), "0992268993f22c640101" ;
+    (fun x -> Other (other_oid, x)), "2a0304"
+  ] in
+  (* Deliberately use BMPString even for fixed-schema attributes. The parser
+     already accepts this: preservation must not silently repair their tags. *)
+  let value = Encoded_string.of_octets ~encoding:`BMP "\x00A" in
+  List.iter (fun (attribute, oid) ->
+      let der = short_tlv 0x30 (short_tlv 0x31
+          (short_tlv 0x30 (short_tlv 0x06 (Ohex.decode oid) ^ "\x1e\x02\x00A"))) in
+      let expected = [Relative_distinguished_name.singleton (attribute value)] in
+      let decoded = decode_name der in
+      Alcotest.(check bool "decoded attribute and tag" true
+                  (equal_representation expected decoded)) ;
+      Alcotest.(check string "constructed attribute DER" der (encode_der expected)) ;
+      Alcotest.(check string "parsed attribute DER" der (encode_der decoded)))
+    attributes
+
+let test_name_matching_and_storage () =
+  let open Distinguished_name in
+  let utf8 = CN (Encoded_string.of_octets "A")
+  and printable = CN (Encoded_string.of_octets ~encoding:`Printable "A")
+  and bmp = CN (Encoded_string.of_octets ~encoding:`BMP "\x00A") in
+  let name attr = [Relative_distinguished_name.singleton attr] in
+  Alcotest.(check bool "tag-agnostic matching" true
+              (equal (name utf8) (name printable))) ;
+  Alcotest.(check bool "representation distinguishes tags" false
+              (equal_representation (name utf8) (name printable))) ;
+  Alcotest.(check bool "wire encoding distinguishes tags" false
+              (String.equal (encode_der (name utf8)) (encode_der (name printable)))) ;
+  Alcotest.(check bool "matching does not transcode BMPString" false
+              (equal (name utf8) (name bmp))) ;
+  Alcotest.(check bool "matching remains case sensitive" false
+              (equal (name utf8) (name (CN (Encoded_string.of_octets "a"))))) ;
+  Alcotest.(check bool "matching distinguishes attribute types" false
+              (equal (name utf8) (name (O (Encoded_string.of_octets "A"))))) ;
+  let mixed_der = Ohex.decode "30163114300806035504030c014130080603550403130141" in
+  let mixed = decode_name mixed_der in
+  let constructed = [Relative_distinguished_name.of_list [printable; utf8; utf8]] in
+  Alcotest.(check bool "storage retains tag differences, not exact duplicates" true
+              (equal_representation mixed constructed)) ;
+  Alcotest.(check string "constructed multi-valued RDN DER"
+              mixed_der (encode_der constructed)) ;
+  (match mixed with
+   | [rdn] ->
+     Alcotest.(check int "tag-only duplicates survive in storage" 2
+                 (Relative_distinguished_name.cardinal rdn)) ;
+     Alcotest.(check bool "set operations distinguish tags" false
+                 (Relative_distinguished_name.equal rdn
+                    (Relative_distinguished_name.singleton utf8)))
+   | _ -> Alcotest.fail "expected one multi-valued RDN") ;
+  Alcotest.(check string "multi-valued RDN DER" mixed_der (encode_der mixed)) ;
+  Alcotest.(check bool "matching collapses tag-only duplicates" true
+              (equal mixed (name printable))) ;
+  Alcotest.(check bool "RDN boundaries still matter" false
+              (equal mixed (name utf8 @ name printable))) ;
+  let organization = name (O (Encoded_string.of_octets "Example")) in
+  Alcotest.(check bool "RDN order still matters" false
+              (equal (organization @ name utf8) (name utf8 @ organization)))
+
+let test_common_name_with_tag_distinct_attributes () =
+  let open Distinguished_name in
+  let attrs = [
+    CN (Encoded_string.of_octets "a.example");
+    O (Encoded_string.of_octets "X");
+    O (Encoded_string.of_octets ~encoding:`Printable "X");
+    O (Encoded_string.of_octets ~encoding:`Teletex "X")
+  ] in
+  let get what = function
+    | Ok value -> value
+    | Error _ -> Alcotest.fail what
+  in
+  let key = `RSA (Mirage_crypto_pk.Rsa.generate ~bits:1024 ()) in
+  let valid_from = Ptime.epoch in
+  let valid_until = match Ptime.add_span valid_from (Ptime.Span.of_int_s 3600) with
+    | Some time -> time
+    | None -> assert false
+  in
+  let expected = Host.Set.singleton
+      (`Strict, Domain_name.host_exn (Domain_name.of_string_exn "a.example")) in
+  List.iter (fun attrs ->
+      let rdn = List.fold_left (fun rdn attr ->
+          Relative_distinguished_name.add attr rdn)
+          Relative_distinguished_name.empty attrs in
+      let name = [rdn] in
+      (match common_name name with
+       | Some value -> Alcotest.(check string "CN survives tag-distinct attributes"
+                                  "a.example" (Encoded_string.to_octets value))
+       | None -> Alcotest.fail "CN disappeared from a multi-valued RDN");
+      let request = get "create mixed-RDN CSR" (Signing_request.create name key) in
+      Alcotest.(check bool "CSR hostname fallback" true
+                  (Host.Set.equal expected (Signing_request.hostnames request)));
+      let certificate = get "sign mixed-RDN certificate"
+          (Signing_request.sign request ~valid_from ~valid_until key name) in
+      Alcotest.(check bool "certificate hostname fallback" true
+                  (Host.Set.equal expected (Certificate.hostnames certificate))))
+    [attrs; List.rev attrs]
+
+let test_encoded_name_issuance () =
+  let open Distinguished_name in
+  let key () = `RSA (Mirage_crypto_pk.Rsa.generate ~bits:1024 ())
+  and get what = function
+    | Ok value -> value
+    | Error _ -> Alcotest.fail ("couldn't " ^ what)
+  in
+  let valid_from = Ptime.epoch
+  and valid_until =
+    match Ptime.add_span Ptime.epoch (Ptime.Span.of_int_s 3600) with
+    | Some time -> time
+    | None -> assert false
+  in
+  let ca_der = Ohex.decode "3015311330110603550403130a4578616d706c65204341"
+  and leaf_der = Ohex.decode "301a311830160603550403130f7777772e6578616d706c652e636f6d" in
+  let ca_name = decode_name ca_der
+  and ca_key = key () in
+  let ca_extensions = Extension.(add Key_usage (true, [`Key_cert_sign])
+      (singleton Basic_constraints (true, (true, None)))) in
+  let ca_request = Signing_request.create ca_name ca_key |> get "create CA CSR" in
+  let ca = Signing_request.sign ca_request ~valid_from ~valid_until
+      ~extensions:ca_extensions ca_key ca_name |> get "sign CA" in
+  let ca = Certificate.decode_der (Certificate.encode_der ca) |> get "decode CA" in
+  let leaf_request = Signing_request.create (decode_name leaf_der) (key ())
+                     |> get "create leaf CSR" in
+  let leaf_request = Signing_request.decode_der (Signing_request.encode_der leaf_request)
+                     |> get "decode leaf CSR" in
+  let leaf = Signing_request.sign_certificate leaf_request ~valid_from ~valid_until
+      ca_key ca |> get "sign leaf" in
+  let leaf = Certificate.decode_der (Certificate.encode_der leaf) |> get "decode leaf" in
+  (* Literal DER expectations cannot pass merely because both sides lost tags. *)
+  Alcotest.(check string "CA subject retains PrintableString"
+              ca_der (encode_der (Certificate.subject ca))) ;
+  Alcotest.(check string "CSR subject retains PrintableString"
+              leaf_der (encode_der (Signing_request.info leaf_request).subject)) ;
+  Alcotest.(check string "leaf subject retains PrintableString"
+              leaf_der (encode_der (Certificate.subject leaf))) ;
+  Alcotest.(check string "leaf issuer retains PrintableString"
+              ca_der (encode_der (Certificate.issuer leaf))) ;
+  (* Changing storage equality must not tighten issuer matching. *)
+  let utf8_issuer = [Relative_distinguished_name.singleton
+                      (CN (Encoded_string.of_octets "Example CA"))] in
+  let mixed_leaf = Signing_request.sign leaf_request ~valid_from ~valid_until
+      ca_key utf8_issuer |> get "sign mixed-encoding leaf" in
+  Alcotest.(check bool "mixed issuer differs in representation" false
+              (equal_representation (Certificate.subject ca) (Certificate.issuer mixed_leaf))) ;
+  (match Validation.verify_chain ~host:None ~time:(fun () -> None)
+           ~anchors:[ca] [mixed_leaf] with
+   | Ok _ -> ()
+   | Error err -> Alcotest.failf "mixed-encoding chain: %a"
+                    Validation.pp_chain_error err) ;
+  (* SHA1 of the literal PrintableString CA Name, independently computed.
+     Only the unrelated key hash varies with the freshly generated key. *)
+  let expected_request =
+    Ohex.decode ("30423040303e303c303a300906052b0e03021a05000414" ^
+                 "ef0085e8bdda047c568dcf61fc7da44493fdf0e6" ^ "0414") ^
+    Public_key.fingerprint ~hash:`SHA1 (Certificate.public_key ca) ^ "\x02\x01\x2a"
+  in
+  let request = OCSP.Request.create [OCSP.create_cert_id ~hash:`SHA1 ca "\x2a"]
+                |> get "create OCSP request" in
+  Alcotest.(check string "OCSP issuerNameHash covers preserved tag"
+              expected_request (OCSP.Request.encode_der request))
 
 let test_yubico () =
   ignore (cert "yubico")
@@ -348,6 +568,12 @@ let regression_tests = [
   "name constraint parsing (DNS: .gr)", `Quick, test_name_constraints ;
   "complex distinguished name", `Quick, test_distinguished_name ;
   "distinguished name pp", `Quick, test_distinguished_name_pp ;
+  "encoded name roundtrip", `Quick, test_encoded_name_roundtrip ;
+  "all attribute tags", `Quick, test_all_attribute_tags ;
+  "name matching and storage", `Quick, test_name_matching_and_storage ;
+  "encoded name issuance and OCSP", `Quick, test_encoded_name_issuance ;
+  "CN lookup with tag-distinct RDN members", `Quick,
+    test_common_name_with_tag_distinct_attributes ;
   "algorithm without null", `Quick, test_yubico ;
   "valid until generalized_time with fractional seconds", `Quick, test_frac_s ;
   "parse valid key where 1 <> d * e mod (p - 1) * (q - 1)", `Quick, test_gcloud_key ;
