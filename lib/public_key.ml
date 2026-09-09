@@ -13,6 +13,7 @@ type t = [
 ]
 
 module Asn_oid = Asn.OID
+module Asn_syntax = Asn
 
 module Asn = struct
   open Asn_grammars
@@ -54,15 +55,17 @@ module Asn = struct
     | (EC_pub `SECP521R1, cs) -> `P521 (to_err (P521.Dsa.pub_of_octets cs))
     | _ -> parse_error "unknown public key algorithm"
 
-  let unparse_pk =
+  let unparse_pk_with_compression ~compress =
     let open Mirage_crypto_ec in
     let open Algorithm in
     function
     | `RSA pk    -> (RSA, rsa_pub_to_octets pk)
     | `ED25519 pk -> (ED25519, Ed25519.pub_to_octets pk)
-    | `P256 pk -> (EC_pub `SECP256R1, P256.Dsa.pub_to_octets pk)
-    | `P384 pk -> (EC_pub `SECP384R1, P384.Dsa.pub_to_octets pk)
-    | `P521 pk -> (EC_pub `SECP521R1, P521.Dsa.pub_to_octets pk)
+    | `P256 pk -> (EC_pub `SECP256R1, P256.Dsa.pub_to_octets ~compress pk)
+    | `P384 pk -> (EC_pub `SECP384R1, P384.Dsa.pub_to_octets ~compress pk)
+    | `P521 pk -> (EC_pub `SECP521R1, P521.Dsa.pub_to_octets ~compress pk)
+
+  let unparse_pk = unparse_pk_with_compression ~compress:false
 
   let pk_info_der =
     map reparse_pk unparse_pk @@
@@ -72,6 +75,82 @@ module Asn = struct
 
   let (pub_info_of_octets, pub_info_to_octets) =
     projections_of Asn.der pk_info_der
+end
+
+module Info : sig
+  type key = t
+  type t
+
+  (** Uses an uncompressed EC point and conventional algorithm parameters. *)
+  val of_key : key -> t
+
+  val key : t -> key
+  val algorithm : t -> Algorithm.Identifier.t
+
+  (** Reconstructs the BIT STRING payload from the validated mathematical key,
+      preserving compressed versus uncompressed EC point representation. *)
+  val subject_public_key : t -> string
+
+  (** Supported RSA, EC and Ed25519 keys have octet-aligned payloads. Rejects
+      non-octet-aligned BIT STRINGs rather than silently padding them. *)
+  val asn : t Asn_syntax.t
+  val encode_der : t -> string
+  val decode_der : string -> (t, [> `Msg of string ]) result
+end = struct
+  type key = t
+  open Asn_syntax.S
+
+  (* All supported key formats contain whole octets, so the bit length is
+     determined by the key and compression form. No original payload or SPKI
+     bytes are retained. The abstract type keeps the algorithm and key matched. *)
+  type t = {
+    key : key;
+    algorithm : Algorithm.Identifier.t;
+    compress : bool;
+  }
+
+  let of_key key =
+    let algorithm, _ = Asn.unparse_pk key in
+    { key; algorithm = Algorithm.Identifier.of_algorithm algorithm; compress = false }
+
+  let key t = t.key
+  let algorithm t = t.algorithm
+  let subject_public_key t = snd (Asn.unparse_pk_with_compression ~compress:t.compress t.key)
+
+  let octets_of_bits bits =
+    let length = Array.length bits in
+    if length mod 8 <> 0 then
+      parse_error "public key BIT STRING is not octet-aligned";
+    String.init (length / 8) (fun i ->
+        let octet = ref 0 in
+        for bit = 0 to 7 do
+          if bits.(8 * i + bit) then octet := !octet lor (1 lsl (7 - bit))
+        done;
+        Char.chr !octet)
+
+  let bits_of_octets octets =
+    Array.init (8 * String.length octets) (fun bit ->
+        Char.code octets.[bit / 8] land (1 lsl (7 - bit mod 8)) <> 0)
+
+  let of_components (algorithm, bits) =
+    let octets = octets_of_bits bits in
+    let key = Asn.reparse_pk (Algorithm.Identifier.algorithm algorithm, octets) in
+    let compress = match key with
+      | #ecdsa -> octets.[0] = '\002' || octets.[0] = '\003'
+      | `RSA _ | `ED25519 _ -> false
+    in
+    { key; algorithm; compress }
+
+  let to_components t = t.algorithm, bits_of_octets (subject_public_key t)
+
+  let asn =
+    map of_components to_components @@
+    sequence2
+      (required ~label:"algorithm" Algorithm.Identifier.asn)
+      (required ~label:"subjectPK" bit_string)
+
+  let of_der, encode_der = Asn_grammars.projections_of Asn_syntax.der asn
+  let decode_der der = Asn_grammars.err_to_msg (of_der der)
 end
 
 let id k =

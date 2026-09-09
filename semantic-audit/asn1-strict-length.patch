@@ -1,0 +1,12 @@
+diff --git a/src/asn_ber_der.ml b/src/asn_ber_der.ml
+--- a/src/asn_ber_der.ml
++++ b/src/asn_ber_der.ml
+@@ -99,7 +99,7 @@ module R = struct
+           lbody, off_len + 1
+         else
+           let n = big_len ~off:(off + off_len + 1) cfg cs lbody in
+-          ck_redundant cs cfg n 0x7f;
++          ck_redundant cs cfg n 0x80;
+           n, off_len + 1 + lbody
+       in
+       let tag = match t0 land 0xc0 with

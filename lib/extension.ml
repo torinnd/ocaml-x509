@@ -1,4 +1,87 @@
 
+(* Named flags retain their semantic set and BIT STRING width, not encoded
+   octets. Fresh values use the minimal width; decoded zero tails are retained. *)
+module Make_flags (Flag : sig
+    type t
+    val known : (int * t) list
+    val unknown_bit : t -> int option
+    val of_unknown_bit : int -> t
+    val pp : t Fmt.t
+  end) : sig
+  type t
+  val of_list : ?bit_length:int -> Flag.t list -> t
+  val to_list : t -> Flag.t list
+  val bit_length : t -> int
+  val mem : Flag.t -> t -> bool
+  val equal : t -> t -> bool
+  val equal_representation : t -> t -> bool
+  val pp : t Fmt.t
+  val asn : t Asn.t
+end = struct
+  type t = { flags : Flag.t list; bit_length : int }
+
+  let position flag =
+    match Flag.unknown_bit flag with
+    | Some bit ->
+      if bit < 0 || List.mem_assoc bit Flag.known then
+        invalid_arg "Extension: Unknown_bit must be a nonnegative unknown position";
+      bit
+    | None ->
+      match List.find_opt (fun (_, known) -> known = flag) Flag.known with
+      | Some (bit, _) -> bit
+      | None -> invalid_arg "Extension: invalid named bit"
+
+  let of_list ?bit_length flags =
+    let positioned = List.map (fun flag -> position flag, flag) flags in
+    let highest = List.fold_left (fun highest (bit, _) -> max highest bit) (-1) positioned in
+    if highest >= Sys.max_array_length then
+      invalid_arg "Extension: named bit position exceeds maximum array length";
+    let minimum = highest + 1 in
+    let bit_length = Option.value ~default:minimum bit_length in
+    if bit_length < minimum || bit_length > Sys.max_array_length then
+      invalid_arg "Extension: invalid named bit length";
+    let flags = List.map snd
+        (List.sort_uniq (fun (a, _) (b, _) -> Int.compare a b) positioned) in
+    { flags; bit_length }
+
+  let to_list t = t.flags
+  let bit_length t = t.bit_length
+  let mem flag t = List.mem flag t.flags
+  let equal a b = a.flags = b.flags
+  let equal_representation a b = equal a b && a.bit_length = b.bit_length
+  let pp ppf t =
+    Fmt.pf ppf "[%a] (%d bits)" Fmt.(list ~sep:(any ", ") Flag.pp)
+      t.flags t.bit_length
+
+  let of_bits bits =
+    let flags = ref [] in
+    for bit = 0 to Bits.bit_length bits - 1 do
+      if String.get_uint8 (Bits.octets bits) (bit / 8) land (1 lsl (7 - bit mod 8)) <> 0 then
+        let flag = match List.assoc_opt bit Flag.known with
+          | Some flag -> flag
+          | None -> Flag.of_unknown_bit bit
+        in
+        flags := flag :: !flags
+    done;
+    { flags = List.rev !flags; bit_length = Bits.bit_length bits }
+
+  let to_bits t =
+    let octets = Bytes.make ((t.bit_length + 7) / 8) '\000' in
+    List.iter (fun flag ->
+        let bit = position flag in
+        let offset = bit / 8 in
+        Bytes.set_uint8 octets offset
+          (Bytes.get_uint8 octets offset lor (1 lsl (7 - bit mod 8)))) t.flags;
+    match Bits.create ~bit_length:t.bit_length (Bytes.to_string octets) with
+    | Ok bits -> bits
+    | Error (`Msg msg) -> invalid_arg msg
+
+  (* Bits.asn validates unused-bit counts and nonzero padding before projection.
+     A zero tail within the declared width is meaningful representation metadata. *)
+  let asn = Asn.S.map ~random:(fun () -> of_bits (Asn.random Bits.asn))
+      of_bits to_bits Bits.asn
+end
+
 type key_usage = [
   | `Digital_signature
   | `Content_commitment
@@ -9,6 +92,7 @@ type key_usage = [
   | `CRL_sign
   | `Encipher_only
   | `Decipher_only
+  | `Unknown_bit of int
 ]
 
 let pp_key_usage ppf ku =
@@ -22,7 +106,20 @@ let pp_key_usage ppf ku =
      | `Key_cert_sign -> "key cert sign"
      | `CRL_sign -> "CRL sign"
      | `Encipher_only -> "encipher only"
-     | `Decipher_only -> "decipher only")
+     | `Decipher_only -> "decipher only"
+     | `Unknown_bit n -> Printf.sprintf "unknown key-usage bit %d" n)
+
+module Key_usage = Make_flags (struct
+    type t = key_usage
+    let known = [
+      0, `Digital_signature; 1, `Content_commitment; 2, `Key_encipherment;
+      3, `Data_encipherment; 4, `Key_agreement; 5, `Key_cert_sign;
+      6, `CRL_sign; 7, `Encipher_only; 8, `Decipher_only;
+    ]
+    let unknown_bit = function `Unknown_bit bit -> Some bit | _ -> None
+    let of_unknown_bit bit = `Unknown_bit bit
+    let pp = pp_key_usage
+  end)
 
 type extended_key_usage = [
   | `Any
@@ -66,7 +163,10 @@ type priv_key_usage_period = [
 ]
 
 let pp_priv_key_usage_period ppf =
-  let pp_ptime = Ptime.pp_human ~tz_offset_s:0 () in
+  let pp_ptime ppf t =
+    let frac_s = if Ptime.Span.equal (Ptime.frac_s t) Ptime.Span.zero then 0 else 12 in
+    Ptime.pp_human ~frac_s ~tz_offset_s:0 () ppf t
+  in
   function
   | `Interval (start, stop) ->
     Fmt.pf ppf "from %a till %a" pp_ptime start pp_ptime stop
@@ -84,11 +184,64 @@ let pp_name_constraints ppf (permitted, excluded) =
     Fmt.(list ~sep:(any ", ") pp_one) permitted
     Fmt.(list ~sep:(any ", ") pp_one) excluded
 
-type policy = [ `Any | `Something of Asn.oid ]
+(* String contents retain the ASN.1 string choice; BMP contents are big-endian
+   code units, not UTF-8. These are values, not cached extension DER. *)
+type display_text = [
+  | `IA5 of string
+  | `Visible of string
+  | `BMP of string
+  | `UTF8 of string
+]
 
-let pp_policy ppf = function
-  | `Any -> Fmt.string ppf "any"
-  | `Something oid -> Fmt.pf ppf "some oid %a" Asn.OID.pp oid
+type notice_reference = {
+  organization : display_text;
+  notice_numbers : Z.t list;
+}
+
+type user_notice = {
+  notice_ref : notice_reference option;
+  explicit_text : display_text option;
+}
+
+type policy_qualifier = [ `CPS_uri of string | `User_notice of user_notice ]
+
+type policy = {
+  policy_identifier : Asn.oid;
+  policy_qualifiers : policy_qualifier list option;
+}
+
+let policy ?qualifiers policy_identifier =
+  { policy_identifier; policy_qualifiers = qualifiers }
+
+let any_policy ?qualifiers () =
+  policy ?qualifiers Registry.Cert_extn.Cert_policy.any_policy
+
+let is_any_policy p =
+  Asn.OID.equal p.policy_identifier Registry.Cert_extn.Cert_policy.any_policy
+
+let pp_display_text ppf = function
+  | `IA5 s -> Fmt.pf ppf "IA5 %S" s
+  | `Visible s -> Fmt.pf ppf "Visible %S" s
+  | `BMP s -> Fmt.pf ppf "BMP %a" Ohex.pp s
+  | `UTF8 s -> Fmt.pf ppf "UTF8 %S" s
+
+let pp_notice_reference ppf { organization; notice_numbers } =
+  Fmt.pf ppf "organization %a numbers [%a]" pp_display_text organization
+    Fmt.(list ~sep:(any ", ") (using Z.to_string string)) notice_numbers
+
+let pp_user_notice ppf { notice_ref; explicit_text } =
+  Fmt.pf ppf "notice reference %a explicit text %a"
+    Fmt.(option ~none:(any "none") pp_notice_reference) notice_ref
+    Fmt.(option ~none:(any "none") pp_display_text) explicit_text
+
+let pp_policy_qualifier ppf = function
+  | `CPS_uri uri -> Fmt.pf ppf "CPS URI %S" uri
+  | `User_notice notice -> Fmt.pf ppf "user notice %a" pp_user_notice notice
+
+let pp_policy ppf p =
+  Fmt.pf ppf "%a qualifiers %a" Asn.OID.pp p.policy_identifier
+    Fmt.(option ~none:(any "none") (list ~sep:(any "; ") pp_policy_qualifier))
+    p.policy_qualifiers
 
 type reason = [
   | `Unspecified
@@ -143,30 +296,65 @@ let pp_reason ppf r =
       | `Privilege_withdrawn -> "privilege withdrawn"
       | `AA_compromise -> "AA compromise")
 
+(* ReasonFlags is a named bit list, NOT CRLReason ENUMERATED. In particular,
+   privilegeWithdrawn/aaCompromise occupy bits 7/8 but enum codes 9/10.
+   removeFromCRL has no flag, and bit 0 is named unused, not unspecified. *)
+type reason_flag = [
+  | `Unused
+  | `Key_compromise
+  | `CA_compromise
+  | `Affiliation_changed
+  | `Superseded
+  | `Cessation_of_operation
+  | `Certificate_hold
+  | `Privilege_withdrawn
+  | `AA_compromise
+  | `Unknown_bit of int
+]
+
+let pp_reason_flag ppf = function
+  | `Unused -> Fmt.string ppf "unused"
+  | `Unknown_bit n -> Fmt.pf ppf "unknown reason bit %d" n
+  | (`Key_compromise | `CA_compromise | `Affiliation_changed | `Superseded
+    | `Cessation_of_operation | `Certificate_hold | `Privilege_withdrawn
+    | `AA_compromise) as r -> pp_reason ppf r
+
+module Reason_flags = Make_flags (struct
+    type t = reason_flag
+    let known = [
+      0, `Unused; 1, `Key_compromise; 2, `CA_compromise;
+      3, `Affiliation_changed; 4, `Superseded; 5, `Cessation_of_operation;
+      6, `Certificate_hold; 7, `Privilege_withdrawn; 8, `AA_compromise;
+    ]
+    let unknown_bit = function `Unknown_bit bit -> Some bit | _ -> None
+    let of_unknown_bit bit = `Unknown_bit bit
+    let pp = pp_reason_flag
+  end)
+
 type distribution_point_name =
   [ `Full of General_name.t
-  | `Relative of Distinguished_name.t ]
+  | `Relative of Distinguished_name.Relative_distinguished_name.t ]
 
 let pp_distribution_point_name ppf = function
   | `Full name -> Fmt.pf ppf "full %a" General_name.pp name
-  | `Relative name -> Fmt.pf ppf "relative %a" Distinguished_name.pp name
+  | `Relative name -> Fmt.pf ppf "relative %a" Distinguished_name.pp [ name ]
 
 type distribution_point =
   distribution_point_name option *
-  reason list option *
+  Reason_flags.t option *
   General_name.t option
 
 let pp_distribution_point ppf (name, reasons, issuer) =
   Fmt.pf ppf "name %a reason %a issuer %a"
     Fmt.(option ~none:(any "none") pp_distribution_point_name) name
-    Fmt.(option ~none:(any "none") (list ~sep:(any ", ") pp_reason)) reasons
+    Fmt.(option ~none:(any "none") Reason_flags.pp) reasons
     Fmt.(option ~none:(any "none") General_name.pp) issuer
 
 let pp_issuing_distribution_point ppf (name, onlyuser, onlyca, onlysome, indirectcrl, onlyattributes) =
   Fmt.pf ppf "name %a only user certs %B only CA certs %B only reasons %a indirectcrl %B only attribute certs %B"
     Fmt.(option ~none:(any "none") pp_distribution_point_name) name
     onlyuser onlyca
-    Fmt.(option ~none:(any "no") (list ~sep:(any ", ") pp_reason)) onlysome
+    Fmt.(option ~none:(any "no") Reason_flags.pp) onlysome
     indirectcrl onlyattributes
 
 type 'a extension = bool * 'a
@@ -177,7 +365,7 @@ type _ k =
   | Authority_key_id : authority_key_id extension k
   | Subject_key_id : string extension k
   | Issuer_alt_name : General_name.t extension k
-  | Key_usage : key_usage list extension k
+  | Key_usage : Key_usage.t extension k
   | Ext_key_usage : extended_key_usage list extension k
   | Basic_constraints : (bool * int option) extension k
   | CRL_number : int extension k
@@ -185,7 +373,7 @@ type _ k =
   | Priv_key_period : priv_key_usage_period extension k
   | Name_constraints : (name_constraint * name_constraint) extension k
   | CRL_distribution_points : distribution_point list extension k
-  | Issuing_distribution_point : (distribution_point_name option * bool * bool * reason list option * bool * bool) extension k
+  | Issuing_distribution_point : (distribution_point_name option * bool * bool * Reason_flags.t option * bool * bool) extension k
   | Freshest_CRL : distribution_point list extension k
   | Reason : reason extension k
   | Invalidity_date : Ptime.t extension k
@@ -209,7 +397,7 @@ let pp_one' : type a. (Format.formatter -> Asn.oid * string -> unit) -> a k -> F
       General_name.pp alt
   | Key_usage, (crit, ku) ->
     Fmt.pf ppf "%skeyUsage %a" (c_to_str crit)
-      Fmt.(list ~sep:(any ", ") pp_key_usage) ku
+      Key_usage.pp ku
   | Ext_key_usage, (crit, eku) ->
     Fmt.pf ppf "%sextendedKeyUsage %a" (c_to_str crit)
       Fmt.(list ~sep:(any ", ") pp_extended_key_usage) eku
@@ -238,7 +426,9 @@ let pp_one' : type a. (Format.formatter -> Asn.oid * string -> unit) -> a k -> F
     Fmt.pf ppf "%sreason %a" (c_to_str crit) pp_reason reason
   | Invalidity_date, (crit, date) ->
     Fmt.pf ppf "%sinvalidityDate %a" (c_to_str crit)
-      (Ptime.pp_human ~tz_offset_s:0 ()) date
+      (Ptime.pp_human
+         ~frac_s:(if Ptime.Span.equal (Ptime.frac_s date) Ptime.Span.zero then 0 else 12)
+         ~tz_offset_s:0 ()) date
   | Certificate_issuer, (crit, name) ->
     Fmt.pf ppf "%scertificateIssuer %a" (c_to_str crit) General_name.pp name
   | Policies, (crit, pols) ->
@@ -325,10 +515,142 @@ module K = struct
     | Unsupported oid, Unsupported oid' when Asn.OID.equal oid oid' -> Eq
     | a, b ->
       let r = Asn.OID.compare (to_oid a) (to_oid b) in
-      if r = 0 then assert false else if r < 0 then Lt else Gt
+      if r < 0 then Lt else if r > 0 then Gt else
+        (* A known constructor and Unsupported can name the same OID but do
+           not have equal value types. Insertion rejects this alias below;
+           lookup/removal still need a total, type-safe key comparison. *)
+        match a, b with
+        | Unsupported _, _ -> Gt
+        | _, Unsupported _ -> Lt
+        | _ -> assert false
 end
 
-include Gmap.Make(K)
+let supported_oids = [
+  ID.subject_alternative_name; ID.authority_key_identifier;
+  ID.subject_key_identifier; ID.issuer_alternative_name; ID.key_usage;
+  ID.extended_key_usage; ID.basic_constraints; ID.crl_number;
+  ID.delta_crl_indicator; ID.private_key_usage_period; ID.name_constraints;
+  ID.crl_distribution_points; ID.issuing_distribution_point; ID.freshest_crl;
+  ID.reason_code; ID.invalidity_date; ID.certificate_issuer;
+  ID.certificate_policies_2;
+]
+
+let validate_key : type a. a k -> unit = function
+  | Unsupported oid when List.exists (Asn.OID.equal oid) supported_oids ->
+    invalid_arg "Extension: a supported OID requires its typed constructor"
+  | _ -> ()
+
+let normalize_eku = function
+  | `Other oid as original ->
+    let open ID.Extended_usage in
+    (match List.find_opt (fun (known, _) -> Asn.OID.equal oid known)
+       [ any, `Any; server_auth, `Server_auth; client_auth, `Client_auth;
+         code_signing, `Code_signing; email_protection, `Email_protection;
+         ipsec_end_system, `Ipsec_end; ipsec_tunnel, `Ipsec_tunnel;
+         ipsec_user, `Ipsec_user; time_stamping, `Time_stamping;
+         ocsp_signing, `Ocsp_signing ] with
+     | Some (_, usage) -> usage | None -> original)
+  | usage -> usage
+
+let normalize_value : type a. a k -> a -> a = fun key value ->
+  match key, value with
+  | Ext_key_usage, (critical, usages) -> critical, List.map normalize_eku usages
+  | _ -> value
+
+(* The Gmap.S API remains the key-sorted lookup view (including traversal and
+   order-insensitive equal). The sequence order is separately authoritative:
+   replacement retains its position; insertion appends; removal/filtering
+   preserve survivor order; map retains order; merge/union retain surviving
+   left keys then append surviving right-only keys in right order. Removing
+   and re-adding a key appends it. Unsupported aliases of known OIDs are never
+   insertable, even into an empty map. No extension payload DER is retained. *)
+module Ordered : sig
+  include Gmap.S with type 'a key = 'a k
+  val ordered_bindings : t -> b list
+  val equal_ordered : eq -> t -> t -> bool
+end = struct
+  module Lookup = Gmap.Make(K)
+  type 'a key = 'a k
+  type b = Lookup.b = B : 'a key * 'a -> b
+  type packed_key = Key : 'a key -> packed_key
+  type t = { index : Lookup.t; order : packed_key list }
+
+  let empty = { index = Lookup.empty; order = [] }
+  let is_empty t = Lookup.is_empty t.index
+  let cardinal t = Lookup.cardinal t.index
+  let mem k t = Lookup.mem k t.index
+  let find k t = Lookup.find k t.index
+  let get k t = Lookup.get k t.index
+
+  let add k v t =
+    validate_key k;
+    let order = if mem k t then t.order else t.order @ [ Key k ] in
+    { index = Lookup.add k (normalize_value k v) t.index; order }
+
+  let singleton k v = add k v empty
+  let add_unless_bound k v t =
+    validate_key k;
+    if mem k t then None else Some (add k v t)
+
+  let keep_present index order =
+    List.filter (fun (Key k) -> Lookup.mem k index) order
+
+  let remove k t =
+    let index = Lookup.remove k t.index in
+    { index; order = keep_present index t.order }
+
+  let update k f t =
+    match f (find k t) with None -> remove k t | Some v -> add k v t
+
+  let min_binding t = Lookup.min_binding t.index
+  let max_binding t = Lookup.max_binding t.index
+  let any_binding t = Lookup.any_binding t.index
+  let bindings t = Lookup.bindings t.index
+  let ordered_bindings t =
+    List.map (fun (Key k) -> B (k, Lookup.get k t.index)) t.order
+
+  type eq = Lookup.eq = { f : 'a. 'a key -> 'a -> 'a -> bool }
+  let equal eq a b = Lookup.equal eq a.index b.index
+  let equal_ordered eq a b =
+    let same_key (Key a) (Key b) =
+      match K.compare a b with Gmap.Order.Eq -> true | _ -> false
+    in
+    List.length a.order = List.length b.order &&
+    List.for_all2 same_key a.order b.order && equal eq a b
+
+  type mapper = Lookup.mapper = { f : 'a. 'a key -> 'a -> 'a }
+  let map (f : mapper) t =
+    { t with index = Lookup.map
+        { f = (fun key value -> normalize_value key (f.f key value)) } t.index }
+  let iter f t = Lookup.iter f t.index
+  let fold f t acc = Lookup.fold f t.index acc
+  let for_all f t = Lookup.for_all f t.index
+  let exists f t = Lookup.exists f t.index
+  let filter f t =
+    let index = Lookup.filter f t.index in
+    { index; order = keep_present index t.order }
+
+  let combined_order index a b =
+    keep_present index a.order @
+    List.filter (fun (Key k) ->
+        not (mem k a) && Lookup.mem k index) b.order
+
+  type merger = Lookup.merger = {
+    f : 'a. 'a key -> 'a option -> 'a option -> 'a option
+  }
+  let merge f a b =
+    let index = Lookup.map { f = normalize_value } (Lookup.merge f a.index b.index) in
+    { index; order = combined_order index a b }
+
+  type unionee = Lookup.unionee = {
+    f : 'a. 'a key -> 'a -> 'a -> 'a option
+  }
+  let union f a b =
+    let index = Lookup.map { f = normalize_value } (Lookup.union f a.index b.index) in
+    { index; order = combined_order index a b }
+end
+
+include Ordered
 
 let pp' custom ppf m =
   iter (fun (B (k, v)) -> pp_one' custom k ppf v ; Fmt.sp ppf ()) m
@@ -376,25 +698,99 @@ module Asn = struct
   open Asn.S
   open Asn_grammars
 
-  let display_text =
-    map (function `C1 s -> s | `C2 s -> s | `C3 s -> s | `C4 s -> s)
-      (fun s -> `C4 s)
-    @@
-    choice4 ia5_string visible_string bmp_string utf8_string
+  let bool =
+    let decode = function
+      | "\000" -> false
+      | "\255" -> true
+      | _ -> parse_error "extension BOOLEAN must be one octet, 00 or ff"
+    and encode value = if value then "\255" else "\000" in
+    map ~random:Random.bool decode encode (implicit ~cls:`Universal 1 octet_string)
+
+  let default_false label = function
+    | None -> false
+    | Some true -> true
+    | Some false -> parse_error "%s: explicit DEFAULT FALSE" label
+
+  let display_text : display_text Asn.t =
+    map
+      (function `C1 s -> `IA5 s | `C2 s -> `Visible s
+              | `C3 s -> `BMP s | `C4 s -> `UTF8 s)
+      (function `IA5 s -> `C1 s | `Visible s -> `C2 s
+              | `BMP s -> `C3 s | `UTF8 s -> `C4 s)
+    @@ choice4 ia5_string visible_string bmp_string utf8_string
+
+  (* ASN.1 INTEGER contents are two's complement. Notice numbers have no
+     machine-word bound; project them to genuine signed arbitrary integers. *)
+  let notice_number =
+    let decode octets =
+      let n = Mirage_crypto_pk.Z_extra.of_octets_be octets in
+      if Char.code octets.[0] land 0x80 = 0 then n
+      else Z.sub n (Z.shift_left Z.one (8 * String.length octets))
+    and encode n =
+      let negative = Z.sign n < 0 in
+      let bits = 1 + Z.numbits (if negative then Z.lognot n else n) in
+      let size = max 1 ((bits + 7) / 8) in
+      let n = if negative then Z.add n (Z.shift_left Z.one (8 * size)) else n in
+      Mirage_crypto_pk.Z_extra.to_octets_be ~size n
+    in
+    map decode encode integer
+
+  (* The upstream GeneralizedTime codec only has millisecond precision and
+     pads fractions to three digits. Use its fixed universal tag, but model
+     the contents as Ptime directly, with canonical DER decimal fractions.
+     Sub-picosecond precision and leap seconds are explicitly unsupported;
+     constructed Ptime values are never rounded or truncated. *)
+  let generalized_time =
+    let decode s =
+      let n = String.length s in
+      let bad () = parse_error "noncanonical extension GeneralizedTime" in
+      let digits start len =
+        for i = start to start + len - 1 do
+          if s.[i] < '0' || s.[i] > '9' then bad ()
+        done
+      in
+      if n < 15 || s.[n - 1] <> 'Z' then bad ();
+      digits 0 14;
+      let ps =
+        if n = 15 then 0L else begin
+          if s.[14] <> '.' || n < 17 || s.[n - 2] = '0' then bad ();
+          let len = n - 16 in
+          digits 15 len;
+          if len > 12 then
+            parse_error "unsupported sub-picosecond extension GeneralizedTime";
+          let fraction = Int64.of_string (String.sub s 15 len) in
+          let rec pad n value =
+            if n = 0 then value else pad (n - 1) (Int64.mul value 10L)
+          in
+          pad (12 - len) fraction
+        end
+      in
+      let number start len = int_of_string (String.sub s start len) in
+      let date = number 0 4, number 4 2, number 6 2 in
+      let hh, mm, ss = number 8 2, number 10 2, number 12 2 in
+      if ss = 60 then parse_error "unsupported GeneralizedTime leap second";
+      match Ptime.of_date_time (date, ((hh, mm, ss), 0)) with
+      | None -> parse_error "invalid extension GeneralizedTime date"
+      | Some t ->
+        match Ptime.add_span t (Ptime.Span.v (0, ps)) with
+        | Some t -> t
+        | None -> parse_error "extension GeneralizedTime out of range"
+    and encode t =
+      let (y, m, d), ((hh, mm, ss), _) = Ptime.to_date_time ~tz_offset_s:0 t in
+      let _, ps = Ptime.Span.to_d_ps (Ptime.frac_s t) in
+      let fraction = if ps = 0L then "" else
+          let digits = Printf.sprintf "%012Ld" ps in
+          let rec trim n = if digits.[n - 1] = '0' then trim (n - 1) else n in
+          "." ^ String.sub digits 0 (trim 12)
+      in
+      Printf.sprintf "%04d%02d%02d%02d%02d%02d%sZ" y m d hh mm ss fraction
+    in
+    map ~random:(fun () -> Asn.random Asn.S.generalized_time)
+      decode encode (implicit ~cls:`Universal 24 ia5_string)
 
   module ID = Registry.Cert_extn
 
-  let key_usage : key_usage list Asn.t = bit_string_flags [
-      0, `Digital_signature
-    ; 1, `Content_commitment
-    ; 2, `Key_encipherment
-    ; 3, `Data_encipherment
-    ; 4, `Key_agreement
-    ; 5, `Key_cert_sign
-    ; 6, `CRL_sign
-    ; 7, `Encipher_only
-    ; 8, `Decipher_only
-    ]
+  let key_usage = Key_usage.asn
 
   let ext_key_usage =
     let open ID.Extended_usage in
@@ -425,16 +821,25 @@ module Asn = struct
     in
     map (List.map f) (List.map g) @@ sequence_of oid
 
+  (* cA is DEFAULT FALSE, but pathLen is OPTIONAL, not DEFAULT 0:
+     in particular Some 0 must survive both projections. *)
   let basic_constraints =
-    map (fun (a, b) -> (Option.value ~default:false a, b))
+    map (fun (a, b) -> (default_false "basicConstraints cA" a, b))
         (fun (a, b) -> ((if a = false then None else Some a), b))
     @@
     sequence2
       (optional ~label:"cA"      bool)
       (optional ~label:"pathLen" int)
 
+  (* The issuer lookup view uses empty for absent. Reject present-empty
+     GeneralNames before projecting away that invalid presence. Key identifier
+     and serial options, including empty key identifiers, stay intact. *)
   let authority_key_id =
     map (fun (a, b, c) ->
+        (match b with
+         | Some issuer when General_name.is_empty issuer ->
+           parse_error "empty authorityCertIssuer"
+         | _ -> ());
         (a, Option.value ~default:General_name.empty b, c))
       (fun (a, b, c) ->
          (a, (if General_name.is_empty b then None else Some b), c))
@@ -456,13 +861,18 @@ module Asn = struct
       | `Not_after  t2     -> (None   , Some t2) in
     map f g @@
     sequence2
-      (optional ~label:"notBefore" @@ implicit 0 generalized_time_no_frac_s)
-      (optional ~label:"notAfter"  @@ implicit 1 generalized_time_no_frac_s)
+      (optional ~label:"notBefore" @@ implicit 0 generalized_time)
+      (optional ~label:"notAfter"  @@ implicit 1 generalized_time)
 
+  (* minimum has DEFAULT 0; maximum is OPTIONAL and Some 0 is distinct from
+     None. Reject explicit defaults and present-empty GeneralSubtrees before
+     their projection collapses them to absence. *)
   let name_constraints =
     let subtree =
       map
-        (fun (base, min, max) -> (base, Option.value ~default:0 min, max))
+        (fun (base, min, max) ->
+           if min = Some 0 then parse_error "GeneralSubtree minimum: explicit DEFAULT 0";
+           (base, Option.value ~default:0 min, max))
         (fun (base, min, max) -> (base, (if min = 0 then None else Some min), max))
       @@
       sequence3
@@ -471,7 +881,9 @@ module Asn = struct
         (optional ~label:"maximum" @@ implicit 1 int)
     in
     map
-      (fun (a, b) -> (Option.value ~default:[] a, Option.value ~default:[] b))
+      (fun (a, b) ->
+         if a = Some [] || b = Some [] then parse_error "empty GeneralSubtrees";
+         (Option.value ~default:[] a, Option.value ~default:[] b))
       (fun (a, b) -> ((if a = [] then None else Some a),
                       (if b = [] then None else Some b)))
     @@
@@ -481,54 +893,52 @@ module Asn = struct
 
   let cert_policies =
     let open ID.Cert_policy in
-    let qualifier_info =
-      map (function | (oid, `C1 s) when oid = cps     -> s
-                    | (oid, `C2 s) when oid = unotice -> s
-                    | _ -> parse_error "bad policy qualifier")
-        (function s -> (cps, `C1 s))
-      @@
-      sequence2
-        (required ~label:"qualifierId" oid)
-        (required ~label:"qualifier"
-           (choice2
-              ia5_string
-            @@
-            map (function (_, Some s) -> s | _ -> "#(BLAH BLAH)")
-              (fun s -> (None, Some s))
-              (sequence2
-                 (optional ~label:"noticeRef"
-                    (sequence2
-                       (required ~label:"organization" display_text)
-                       (required ~label:"numbers"      (sequence_of integer))))
-                 (optional ~label:"explicitText" display_text))))
+    let notice_reference =
+      map
+        (fun (organization, notice_numbers) -> { organization; notice_numbers })
+        (fun { organization; notice_numbers } -> organization, notice_numbers)
+      @@ sequence2
+        (required ~label:"organization" display_text)
+        (required ~label:"numbers" (sequence_of notice_number))
     in
-    (* "Optional qualifiers, which MAY be present, are not expected to change
-     * the definition of the policy."
-     * Hence, we just drop them.  *)
+    let user_notice =
+      map
+        (fun (notice_ref, explicit_text) -> { notice_ref; explicit_text })
+        (fun { notice_ref; explicit_text } -> notice_ref, explicit_text)
+      @@ sequence2
+        (optional ~label:"noticeRef" notice_reference)
+        (optional ~label:"explicitText" display_text)
+    in
+    let qualifier_info =
+      map
+        (function
+          | (oid, `C1 uri) when Asn.OID.equal oid cps -> `CPS_uri uri
+          | (oid, `C2 notice) when Asn.OID.equal oid unotice -> `User_notice notice
+          | (oid, _) -> parse_error "unsupported or mismatched policy qualifier %a" Asn.OID.pp oid)
+        (function
+          | `CPS_uri uri -> cps, `C1 uri
+          | `User_notice notice -> unotice, `C2 notice)
+      @@ sequence2
+        (required ~label:"qualifierId" oid)
+        (required ~label:"qualifier" (choice2 ia5_string user_notice))
+    in
     sequence_of @@
-    map (function | (oid, _) when oid = any_policy -> `Any
-                  | (oid, _)                       -> `Something oid)
-      (function | `Any           -> (any_policy, None)
-                | `Something oid -> (oid, None))
-    @@
-    sequence2
+    map
+      (fun (policy_identifier, policy_qualifiers) -> { policy_identifier; policy_qualifiers })
+      (fun { policy_identifier; policy_qualifiers } -> policy_identifier, policy_qualifiers)
+    @@ sequence2
       (required ~label:"policyIdentifier" oid)
       (optional ~label:"policyQualifiers" (sequence_of qualifier_info))
 
-  let reason : reason list Asn.t = bit_string_flags [
-      0, `Unspecified
-    ; 1, `Key_compromise
-    ; 2, `CA_compromise
-    ; 3, `Affiliation_changed
-    ; 4, `Superseded
-    ; 5, `Cessation_of_operation
-    ; 6, `Certificate_hold
-    ; 7, `Privilege_withdrawn
-    ; 8, `AA_compromise
-    ]
+  let reason = Reason_flags.asn
 
   let reason_enumerated : reason Asn.t =
     enumerated reason_of_int reason_to_int
+
+  (* nameRelativeToCRLIssuer is one RDN (SET OF AVAs), not Name (SEQUENCE OF
+     RDNs). Reuse the same typed attributes and string choices as names without
+     accepting the old, incorrectly nested wire shape. *)
+  let relative_distinguished_name = Distinguished_name.Asn.relative_distinguished_name
 
   let distribution_point_name =
     map (function | `C1 s -> `Full s | `C2 s -> `Relative s)
@@ -536,7 +946,7 @@ module Asn = struct
     @@
     choice2
       (implicit 0 General_name.Asn.gen_names)
-      (implicit 1 Distinguished_name.Asn.name)
+      (implicit 1 relative_distinguished_name)
 
   let distribution_point =
     sequence3
@@ -550,11 +960,11 @@ module Asn = struct
     map
       (fun (a, b, c, d, e, f) ->
         (a,
-         Option.value ~default:false b,
-         Option.value ~default:false c,
+         default_false "onlyContainsUserCerts" b,
+         default_false "onlyContainsCACerts" c,
          d,
-         Option.value ~default:false e,
-         Option.value ~default:false f))
+         default_false "indirectCRL" e,
+         default_false "onlyContainsAttributeCerts" f))
       (fun (a, b, c, d, e, f) ->
          (a,
           (if b = false then None else Some b),
@@ -571,22 +981,7 @@ module Asn = struct
       (optional ~label:"indirectCRL"                @@ implicit 4 bool)
       (optional ~label:"onlyContainsAttributeCerts" @@ implicit 5 bool)
 
-  let crl_reason : reason Asn.t =
-    let alist = [
-        0, `Unspecified
-      ; 1, `Key_compromise
-      ; 2, `CA_compromise
-      ; 3, `Affiliation_changed
-      ; 4, `Superseded
-      ; 5, `Cessation_of_operation
-      ; 6, `Certificate_hold
-      ; 8, `Remove_from_CRL
-      ; 9, `Privilege_withdrawn
-      ; 10, `AA_compromise
-      ]
-    in
-    let rev = List.map (fun (k, v) -> (v, k)) alist in
-    enumerated (fun i -> List.assoc i alist) (fun k -> List.assoc k rev)
+  let crl_reason = reason_enumerated
 
   let gen_names_of_str, gen_names_to_str       = project_exn General_name.Asn.gen_names
   and auth_key_id_of_str, auth_key_id_to_str   = project_exn authority_key_id
@@ -601,9 +996,7 @@ module Asn = struct
   and int_of_str, int_to_str                   = project_exn int
   and issuing_dp_of_str, issuing_dp_to_str     = project_exn issuing_distribution_point
   and crl_reason_of_str, crl_reason_to_str     = project_exn crl_reason
-  and time_of_str, time_to_str                 = project_exn generalized_time_no_frac_s
-
-  (* XXX 4.2.1.4. - cert policies! ( and other x509 extensions ) *)
+  and time_of_str, time_to_str                 = project_exn generalized_time
 
   let reparse_extension_exn crit = case_of_oid_f [
       (ID.subject_alternative_name,
@@ -646,6 +1039,7 @@ module Asn = struct
       ~default:(fun oid -> fun cs -> B (Unsupported oid, (crit, cs)))
 
   let unparse_extension (B (k, v)) =
+    validate_key k;
     let v' = match k, v with
       | Subject_alt_name, (_, x) -> gen_names_to_str x
       | Issuer_alt_name, (_, x) -> gen_names_to_str x
@@ -669,10 +1063,14 @@ module Asn = struct
     in
     to_oid k, critical k v, v'
 
+  (* Noncanonical defaults and named bit lists are rejected by their component
+     decoders, including when certificates are embedded in another grammar.
+     Required sequence payloads and OPTIONAL values without defaults keep
+     their order and presence. Duplicate OIDs reject, never overwrite. *)
   let extensions_der =
     let extension =
       let f (oid, crit, cs) =
-        reparse_extension_exn (Option.value ~default:false crit) (oid, cs)
+        reparse_extension_exn (default_false "extension critical" crit) (oid, cs)
       and g b =
         let oid, crit, cs = unparse_extension b in
         (oid, (if crit = false then None else Some crit), cs)
@@ -689,7 +1087,7 @@ module Asn = struct
           | None -> parse_error "%a already bound" (pp_one k) v
           | Some b -> b)
         empty exts
-    and g map = bindings map
+    and g map = ordered_bindings map
     in
     map f g @@ sequence_of extension
 end

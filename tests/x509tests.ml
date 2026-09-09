@@ -111,7 +111,7 @@ let test_cert c usages extusage () =
     let exts = Certificate.extensions c in
     let ku = match Extension.(find Key_usage exts) with
       | None -> []
-      | Some (_crit, ku) -> ku
+      | Some (_crit, ku) -> Extension.Key_usage.to_list ku
     and eku = match Extension.(find Ext_key_usage exts) with
       | None -> []
       | Some (_crit, eku) -> eku

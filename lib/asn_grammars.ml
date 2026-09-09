@@ -54,21 +54,16 @@ let generalized_time_no_frac_s =
            (fun y -> Ptime.truncate ~frac_s:0 y)
            generalized_time)
 
-(* serial number, as defined in RFC 5280 4.1.2.2: must be > 0 and not be longer
-   than 20 octets. we accept 0.
-   we also accept < 0, but when encoding mandate >= 0!
-*)
+(* Keep the content-string API for CRLs and authority key identifiers, but
+   never change a negative serial's sign while encoding it. *)
 let serial =
-  Asn.S.(map
-           (fun x ->
-              if String.length x > 20 then parse_error "serial exceeds 20 octets";
-              if String.length x > 0 && String.get_uint8 x 0 > 0x7F then
-                Log.warn (fun m -> m "negative serial number %a" Ohex.pp x);
-              x)
-           (fun y ->
-              if String.length y > 20 then failwith "serial exceeds 20 octets";
-              if String.length y > 0 && String.get_uint8 y 0 > 0x7F then
-                "\x00" ^ y
-              else
-                y)
-           integer)
+  Asn.S.map
+    (fun serial ->
+       let content = Serial.to_content serial in
+       if Serial.is_negative serial then
+         Log.warn (fun m -> m "negative serial number %a" Ohex.pp content);
+       content)
+    (fun content -> match Serial.of_content content with
+       | Ok serial -> serial
+       | Error (`Msg msg) -> invalid_arg msg)
+    Serial.asn

@@ -4,7 +4,7 @@
  (private_modules asn_grammars registry authenticator certificate validation
                   public_key private_key crl distinguished_name algorithm
                   extension pem signing_request general_name host rc2 p12
-                  key_type)
+                  key_type bits certificate_time serial)
  (libraries asn1-combinators fmt ptime mirage-crypto mirage-crypto-pk
             gmap domain-name base64 logs mirage-crypto-ec kdf.pbkdf
-            mirage-crypto-rng ipaddr ohex))
+            mirage-crypto-rng ipaddr ohex zarith))

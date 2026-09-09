@@ -2,13 +2,18 @@ open X509
 
 let time () = None
 
+(* Use a fixed clock: these tests construct certificates relative to now. *)
+module Ptime_clock = struct
+  let now () = Ptime.epoch
+end
+
 (* some revocation scenarios to convince myself *)
 let ca_exts ?pathlen () =
   let ku =
     [ `Key_cert_sign ; `CRL_sign ; `Digital_signature ; `Content_commitment ]
   in
   Extension.(add Basic_constraints (true, (true, pathlen))
-               (singleton Key_usage (true, ku)))
+               (singleton Key_usage (true, Key_usage.of_list ku)))
 
 let key_ids exts subject_pubkey issuer_pubkey =
   let subject_key_id =
@@ -21,7 +26,7 @@ let key_ids exts subject_pubkey issuer_pubkey =
                (add Authority_key_id authority_key_id exts))
 
 let leaf_exts =
-  Extension.(add Key_usage (true, [ `Digital_signature ; `Key_encipherment ])
+  Extension.(add Key_usage (true, Key_usage.of_list [ `Digital_signature ; `Key_encipherment ])
                (add Ext_key_usage (true, [ `Server_auth ])
                   (singleton Basic_constraints (true, (false, None)))))
 
@@ -36,7 +41,7 @@ let key () =
 
 let selfsigned ?(name = "test") now =
   let pub, priv = key () in
-  let name = [ Distinguished_name.(Relative_distinguished_name.singleton (CN name)) ] in
+  let name = [ Distinguished_name.(Relative_distinguished_name.singleton (CN (Encoded_string.of_octets name))) ] in
   match Signing_request.create name priv with
   | Error _ -> assert false
   | Ok req ->
@@ -47,7 +52,7 @@ let selfsigned ?(name = "test") now =
 
 let cert ?serial ?(name = "sub") now ca pubca privca issuer =
   let pub, priv = key () in
-  let name = [ Distinguished_name.(Relative_distinguished_name.singleton (CN name)) ] in
+  let name = [ Distinguished_name.(Relative_distinguished_name.singleton (CN (Encoded_string.of_octets name))) ] in
   match Signing_request.create name priv with
   | Error _ -> assert false
   | Ok req ->

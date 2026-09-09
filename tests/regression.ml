@@ -75,14 +75,14 @@ let test_distinguished_name () =
   let open Distinguished_name in
   let crt = cert "PostaCARoot" in
   let expected = [
-    Relative_distinguished_name.singleton (DC "rs") ;
-    Relative_distinguished_name.singleton (DC "posta") ;
-    Relative_distinguished_name.singleton (DC "ca") ;
-    Relative_distinguished_name.singleton (CN "Configuration") ;
-    Relative_distinguished_name.singleton (CN "Services") ;
-    Relative_distinguished_name.singleton (CN "Public Key Services") ;
-    Relative_distinguished_name.singleton (CN "AIA") ;
-    Relative_distinguished_name.singleton (CN "Posta CA Root")
+    Relative_distinguished_name.singleton (DC (Encoded_string.of_octets ~encoding:`IA5 "rs")) ;
+    Relative_distinguished_name.singleton (DC (Encoded_string.of_octets ~encoding:`IA5 "posta")) ;
+    Relative_distinguished_name.singleton (DC (Encoded_string.of_octets ~encoding:`IA5 "ca")) ;
+    Relative_distinguished_name.singleton (CN (Encoded_string.of_octets "Configuration")) ;
+    Relative_distinguished_name.singleton (CN (Encoded_string.of_octets "Services")) ;
+    Relative_distinguished_name.singleton (CN (Encoded_string.of_octets "Public Key Services")) ;
+    Relative_distinguished_name.singleton (CN (Encoded_string.of_octets "AIA")) ;
+    Relative_distinguished_name.singleton (CN (Encoded_string.of_octets "Posta CA Root"))
   ] in
   Alcotest.(check check_dn "complex issuer is good"
               expected (Certificate.issuer crt)) ;
@@ -92,9 +92,9 @@ let test_distinguished_name () =
 let test_distinguished_name_pp () =
   let module Dn = struct
     include Distinguished_name
-    let cn s = Relative_distinguished_name.singleton (CN s)
-    let o s = Relative_distinguished_name.singleton (O s)
-    let initials s = Relative_distinguished_name.singleton (Initials s)
+    let cn s = Relative_distinguished_name.singleton (CN (Encoded_string.of_octets s))
+    let o s = Relative_distinguished_name.singleton (O (Encoded_string.of_octets s))
+    let initials s = Relative_distinguished_name.singleton (Initials (Encoded_string.of_octets s))
     let (+) = Relative_distinguished_name.union
   end in
   let dn1 = "DN1", Dn.[o "Blanc";
@@ -341,7 +341,7 @@ let ec_priv file pub_file () =
 let sign_with_intermediate () =
   let key () = `RSA (Mirage_crypto_pk.Rsa.generate ~bits:1024 ())
   and name value =
-    Distinguished_name.[Relative_distinguished_name.singleton (CN value)]
+    Distinguished_name.[Relative_distinguished_name.singleton (CN (Encoded_string.of_octets value))]
   and get what = function
     | Ok value -> value
     | Error _ -> Alcotest.fail ("couldn't " ^ what)
@@ -352,10 +352,10 @@ let sign_with_intermediate () =
     | None -> assert false
   in
   let ca_extensions = Extension.(
-      add Key_usage (true, [`Key_cert_sign])
+      add Key_usage (true, Key_usage.of_list [`Key_cert_sign])
         (singleton Basic_constraints (true, (true, None))))
   and leaf_extensions = Extension.(
-      add Key_usage (true, [`Digital_signature; `Key_encipherment])
+      add Key_usage (true, Key_usage.of_list [`Digital_signature; `Key_encipherment])
         (add Ext_key_usage (true, [`Server_auth])
            (singleton Basic_constraints (true, (false, None)))))
   in

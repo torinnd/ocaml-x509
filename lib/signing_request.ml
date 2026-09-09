@@ -35,8 +35,14 @@ type request_info = {
   extensions : Ext.t ;
 }
 
+type request_info_data = {
+  subject : Distinguished_name.t ;
+  pk_info : Public_key.Info.t ;
+  extensions : Ext.t ;
+}
+
 type request = {
-  info : request_info ;
+  info : request_info_data ;
   signature_algorithm : Algorithm.t ;
   signature : string
 }
@@ -71,7 +77,7 @@ module Asn = struct
                     Extension.Asn.extensions_der)))
   let request_info =
     let f = function
-      | (0, subject, public_key, extensions) ->
+      | (0, subject, pk_info, extensions) ->
         let extensions =
           List.fold_left (fun map (Ext.B (k, v)) ->
               match Ext.add_unless_bound k v map with
@@ -80,18 +86,18 @@ module Asn = struct
               | Some b -> b)
         Ext.empty extensions
         in
-        { subject ; public_key ; extensions }
+        { subject ; pk_info ; extensions }
       | _ ->
         parse_error "unknown certificate request info"
-    and g { subject ; public_key ; extensions } =
+    and g { subject ; pk_info ; extensions } =
       let extensions = Ext.bindings extensions in
-      (0, subject, public_key, extensions)
+      (0, subject, pk_info, extensions)
     in
     map f g @@
     sequence4
       (required ~label:"version" int)
       (required ~label:"subject" Distinguished_name.Asn.name)
-      (required ~label:"subjectPKInfo" Public_key.Asn.pk_info_der)
+      (required ~label:"subjectPKInfo" Public_key.Info.asn)
       (required ~label:"attributes" @@ implicit 0 (set_of attributes))
 
   let request_info_of_str, request_info_to_str =
@@ -113,7 +119,9 @@ module Asn = struct
     projections_of Asn.der signing_request
 end
 
-let info { asn ; _ } = asn.info
+let info { asn ; _ } : request_info =
+  let { subject; pk_info; extensions } = asn.info in
+  { subject; public_key = Public_key.Info.key pk_info; extensions }
 
 let signature_algorithm { asn ; _ } =
   Algorithm.to_signature_algorithm asn.signature_algorithm
@@ -137,7 +145,7 @@ let hostnames csr =
 let validate_signature allowed_hashes { asn ; raw } =
   let raw_data = Validation.raw_cert_hack raw in
   Validation.validate_raw_signature asn.info.subject allowed_hashes raw_data
-    asn.signature_algorithm asn.signature asn.info.public_key
+    asn.signature_algorithm asn.signature (Public_key.Info.key asn.info.pk_info)
 
 let decode_der ?(allowed_hashes = Validation.sha2) cs =
   let* csr = Asn_grammars.err_to_msg (Asn.signing_request_of_str cs) in
@@ -174,8 +182,8 @@ let default_digest digest key =
 
 let create subject ?digest ?(extensions = Ext.empty) (key : Private_key.t) =
   let hash = default_digest digest key in
-  let public_key = Private_key.public key in
-  let info : request_info = { subject ; public_key ; extensions } in
+  let pk_info = Public_key.Info.of_key (Private_key.public key) in
+  let info = { subject ; pk_info ; extensions } in
   let info_str = Asn.request_info_to_str info in
   let scheme = Key_type.x509_default_scheme (Private_key.key_type key) in
   let* signature = Private_key.sign hash ~scheme key (`Message info_str) in
@@ -209,34 +217,40 @@ let sign signing_request
       else
         s
   in
+  let* serial = Certificate.Serial.of_content serial in
+  (* Certificate time encodings have whole-second precision. Retain the
+     signing API's historical truncation, but store the encoded time itself. *)
+  let* valid_from = Certificate.Time.of_ptime (Ptime.truncate ~frac_s:0 valid_from) in
+  let* valid_until = Certificate.Time.of_ptime (Ptime.truncate ~frac_s:0 valid_until) in
   let* () = validate_signature allowed_hashes signing_request in
   let signature_algo =
     let scheme = Key_type.x509_default_scheme (Private_key.key_type key) in
-    Algorithm.of_signature_algorithm scheme hash
+    Algorithm.Identifier.of_algorithm (Algorithm.of_signature_algorithm scheme hash)
   and info = signing_request.asn.info
   in
   let tbs_cert : Certificate.tBSCertificate = {
     version = `V3 ;
+    version_present = true ;
     serial ;
     signature = signature_algo ;
     issuer ;
     validity = (valid_from, valid_until) ;
     subject ;
-    pk_info = info.public_key ;
+    pk_info = info.pk_info ;
     issuer_id = None ;
     subject_id = None ;
-    extensions
+    extensions ;
+    extensions_present = not (Extension.is_empty extensions)
   } in
-  let tbs_raw = Certificate.Asn.tbs_certificate_to_octets tbs_cert in
+  let* tbs_cert, tbs_raw = Certificate.prepare_tbs tbs_cert in
   let scheme = Key_type.x509_default_scheme (Private_key.key_type key) in
   let* signature_val = Private_key.sign hash ~scheme key (`Message tbs_raw) in
   let asn = {
     Certificate.tbs_cert ;
     signature_algo ;
-    signature_val ;
+    signature_val = Certificate.Bits.of_octets signature_val ;
   } in
-  let raw = Certificate.Asn.certificate_to_octets asn in
-  Ok { Certificate.asn ; raw }
+  Ok { Certificate.asn }
 
 let sign_certificate signing_request
     ~valid_from ~valid_until

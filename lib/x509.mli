@@ -99,6 +99,15 @@ module Key_type : sig
       is supported with [key type]. *)
 end
 
+(** Semantic algorithm identifiers with preserved OID and parameter spelling. *)
+module Algorithm_identifier : sig
+  type t
+  val equivalent : t -> t -> bool
+  val signature_algorithm : t -> (Key_type.signature_scheme * Digestif.hash') option
+  val encode_der : t -> string
+  val decode_der : string -> (t, [> `Msg of string ]) result
+end
+
 (** Public keys *)
 module Public_key : sig
   (** Public keys as specified in {{:http://tools.ietf.org/html/rfc5208}PKCS 8}
@@ -162,6 +171,18 @@ module Public_key : sig
 
   (** [encode_pem public_key] is [pem], the pem encoded public key. *)
   val encode_pem : t -> string
+
+  (** Validated key value plus SPKI algorithm and point-encoding metadata. *)
+  module Info : sig
+    type key = t
+    type t
+    val of_key : key -> t
+    val key : t -> key
+    val algorithm : t -> Algorithm_identifier.t
+    val subject_public_key : t -> string
+    val encode_der : t -> string
+    val decode_der : string -> (t, [> `Msg of string ]) result
+  end
 end
 
 (** Private keys *)
@@ -242,38 +263,79 @@ end
 (** X.500 distinguished name *)
 module Distinguished_name : sig
 
+  module Encoded_string : sig
+    type encoding = [ `UTF8 | `Printable | `IA5 | `Universal | `Teletex | `BMP ]
+    type t
+    (** Contents octets and ASN.1 tag, without Unicode transcoding. *)
+    val of_octets : ?encoding:encoding -> string -> t
+    val to_octets : t -> string
+    val encoding : t -> encoding
+    val compare_octets : t -> t -> int
+    val compare : t -> t -> int
+    val equal : t -> t -> bool
+    val pp : t Fmt.t
+  end
+
   (** The variant of a relative distinguished name component, as defined in
     X.500: an attribute type and value. *)
   type attribute =
-    | CN of string
-    | Serialnumber of string
-    | C of string
-    | L of string
-    | ST of string
-    | O of string
-    | OU of string
-    | T of string
-    | DNQ of string
-    | Mail of string
-    | DC of string
-    | Given_name of string
-    | Surname of string
-    | Initials of string
-    | Pseudonym of string
-    | Generation of string
-    | Street of string
-    | Userid of string
-    | Other of Asn.oid * string
+    | CN of Encoded_string.t
+    | Serialnumber of Encoded_string.t
+    | C of Encoded_string.t
+    | L of Encoded_string.t
+    | ST of Encoded_string.t
+    | O of Encoded_string.t
+    | OU of Encoded_string.t
+    | T of Encoded_string.t
+    | DNQ of Encoded_string.t
+    | Mail of Encoded_string.t
+    | DC of Encoded_string.t
+    | Given_name of Encoded_string.t
+    | Surname of Encoded_string.t
+    | Initials of Encoded_string.t
+    | Pseudonym of Encoded_string.t
+    | Generation of Encoded_string.t
+    | Street of Encoded_string.t
+    | Userid of Encoded_string.t
+    | Other of Asn.oid * Encoded_string.t
 
-  (** Relative_distinguished_name is a set of attributes. *)
-  module Relative_distinguished_name : Set.S with type elt = attribute
+  val attribute_of_oid : Asn.oid -> Encoded_string.t -> attribute
+  (** Fresh construction uses conventional tags for the chosen attribute. *)
+  val attribute_of_octets : (Encoded_string.t -> attribute) -> string -> attribute
+
+  (** A representation multiset. Parsed duplicate AVAs are retained; known-OID
+      Other aliases are canonicalized on construction. Union adds multiplicities. *)
+  module Relative_distinguished_name : sig
+    type elt = attribute
+    type t
+    val empty : t
+    val is_empty : t -> bool
+    val singleton : elt -> t
+    val of_list : elt list -> t
+    val elements : t -> elt list
+    val add : elt -> t -> t
+    val union : t -> t -> t
+    val remove : elt -> t -> t
+    val mem : elt -> t -> bool
+    val cardinal : t -> int
+    val compare : t -> t -> int
+    val equal : t -> t -> bool
+    val iter : (elt -> unit) -> t -> unit
+    val fold : (elt -> 'a -> 'a) -> t -> 'a -> 'a
+    val filter : (elt -> bool) -> t -> t
+    val for_all : (elt -> bool) -> t -> bool
+    val exists : (elt -> bool) -> t -> bool
+  end
 
   (** A distinguished name is a list of relative distinguished names, starting
       with the most significant component. *)
   type t = Relative_distinguished_name.t list
 
-  (** [equal a b] is [true] if the distinguished names [a] and [b] are equal. *)
+  (** Legacy logical matching: ignores tags and duplicate equivalent AVAs, but
+      preserves RDN sequence order. This does not perform Unicode normalization. *)
   val equal : t -> t -> bool
+  (** Includes tags and member multiplicities. *)
+  val equal_representation : t -> t -> bool
 
   (** [make_pp ()] creates a customized pretty-printer for {!t}.
 
@@ -318,6 +380,7 @@ module Distinguished_name : sig
   (** [common_name t] is [Some x] if the distinguished name [t] contains a
       [CN x], [None] otherwise. *)
   val common_name : t -> string option
+  val common_name_encoded : t -> Encoded_string.t option
 
   (** [decode_der cs] is [dn], the ASN.1 decoded distinguished name of [cs]. *)
   val decode_der : string -> (t, [> `Msg of string ]) result
@@ -333,19 +396,33 @@ end
     {{:https://tools.ietf.org/html/rfc5280#section-4.2.1.7}IssuerAltName}
     extension. *)
 module General_name : sig
+  module Other_value : sig
+    type t = UTF8 of string | IA5 of string | Null
+    val equal : t -> t -> bool
+    val pp : t Fmt.t
+  end
+  module Encoded_string = Distinguished_name.Encoded_string
   type _ k =
-    | Other : Asn.oid -> string list k
+    | Other : Asn.oid -> Other_value.t list k
     | Rfc_822 : string list k
     | DNS : string list k
     | X400_address : unit k
     | Directory : Distinguished_name.t list k
-    | EDI_party : (string option * string) list k
+    | EDI_party : (Encoded_string.t option * Encoded_string.t) list k
     | URI : string list k
     | IP : string list k
     | Registered_id : Asn.oid list k
 
+  (** Grouped lookup view. Serialization uses ordered occurrences, not bindings.
+      Replacements keep existing positions; surplus values follow their key's last
+      occurrence. New keys append. Empty list values normalize to absence, so
+      cardinal counts only keys with encoded occurrences. *)
   include Gmap.S with type 'a key = 'a k
 
+  val entries : t -> b list
+  (** Each binding must contain one occurrence. *)
+  val of_entries : b list -> t
+  val equal_representation : t -> t -> bool
   val pp : t Fmt.t
 end
 
@@ -365,7 +442,30 @@ module Extension : sig
     | `CRL_sign
     | `Encipher_only
     | `Decipher_only
+    | `Unknown_bit of int
   ]
+
+  (** A semantic set of key usages with its original BIT STRING width. *)
+  module Key_usage : sig
+    type t
+
+    (** [of_list flags] sorts and deduplicates flags by bit position, using the
+        minimal width (zero for an empty set). An explicit [bit_length] retains
+        a wider zero tail. Raises [Invalid_argument] for a length below the
+        highest set bit plus one, a length above [Sys.max_array_length], or an
+        [Unknown_bit] at a known, negative, or unrepresentable position. *)
+    val of_list : ?bit_length:int -> key_usage list -> t
+    val to_list : t -> key_usage list
+    val bit_length : t -> int
+    val mem : key_usage -> t -> bool
+
+    (** Semantic equality ignores bit length. *)
+    val equal : t -> t -> bool
+
+    (** Representation equality includes bit length. *)
+    val equal_representation : t -> t -> bool
+    val pp : t Fmt.t
+  end
 
   (** The polymorphic variant of
   {{:https://tools.ietf.org/html/rfc5280#section-4.2.1.12}extended key usages}. *)
@@ -402,7 +502,30 @@ module Extension : sig
 
   (** Certificate policies, the
       {{:https://tools.ietf.org/html/rfc5280#section-4.2.1.4}policy extension}. *)
-  type policy = [ `Any | `Something of Asn.oid ]
+  type display_text = [
+    | `IA5 of string | `Visible of string | `BMP of string | `UTF8 of string
+  ]
+  type notice_reference = {
+    organization : display_text;
+    notice_numbers : Z.t list;
+  }
+  type user_notice = {
+    notice_ref : notice_reference option;
+    explicit_text : display_text option;
+  }
+  type policy_qualifier = [ `CPS_uri of string | `User_notice of user_notice ]
+  type policy = {
+    policy_identifier : Asn.oid;
+    policy_qualifiers : policy_qualifier list option;
+  }
+  val policy : ?qualifiers:policy_qualifier list -> Asn.oid -> policy
+  val any_policy : ?qualifiers:policy_qualifier list -> unit -> policy
+  val is_any_policy : policy -> bool
+  val pp_display_text : display_text Fmt.t
+  val pp_notice_reference : notice_reference Fmt.t
+  val pp_user_notice : user_notice Fmt.t
+  val pp_policy_qualifier : policy_qualifier Fmt.t
+  val pp_policy : policy Fmt.t
 
   (** Type of
       {{:https://tools.ietf.org/html/rfc5280#section-5.3.1}revocation reasons}
@@ -420,18 +543,46 @@ module Extension : sig
     | `AA_compromise
   ]
 
-  (** Distribution point name, either a full one using general names, or a
-      relative one using a distinguished name. *)
+  (** ReasonFlags bit positions are distinct from CRLReason enumeration codes. *)
+  type reason_flag = [
+    | `Unused | `Key_compromise | `CA_compromise | `Affiliation_changed
+    | `Superseded | `Cessation_of_operation | `Certificate_hold
+    | `Privilege_withdrawn | `AA_compromise | `Unknown_bit of int
+  ]
+  val pp_reason_flag : reason_flag Fmt.t
+
+  (** A semantic set of ReasonFlags, not CRLReason codes, retaining the original
+      BIT STRING width. Bit 0 is [Unused]; bits 7/8 are [Privilege_withdrawn] and
+      [AA_compromise]. [Remove_from_CRL] is only a CRLReason. *)
+  module Reason_flags : sig
+    type t
+
+    (** Sorts and deduplicates by bit position, using minimal width by default.
+        Explicit lengths and [Unknown_bit] are validated as in [Key_usage.of_list]. *)
+    val of_list : ?bit_length:int -> reason_flag list -> t
+    val to_list : t -> reason_flag list
+    val bit_length : t -> int
+    val mem : reason_flag -> t -> bool
+
+    (** Semantic equality ignores bit length. *)
+    val equal : t -> t -> bool
+
+    (** Representation equality includes bit length. *)
+    val equal_representation : t -> t -> bool
+    val pp : t Fmt.t
+  end
+
+  (** Distribution point name, either a full name or one relative RDN. *)
   type distribution_point_name =
     [ `Full of General_name.t
-    | `Relative of Distinguished_name.t ]
+    | `Relative of Distinguished_name.Relative_distinguished_name.t ]
 
   (** {{:https://tools.ietf.org/html/rfc5280#section-4.2.1.13}Distribution point},
-      consisting of an optional name, an optional list of allowed reasons, and
+      consisting of an optional name, an optional set of allowed reasons, and
       an optional issuer. *)
   type distribution_point =
     distribution_point_name option *
-    reason list option *
+    Reason_flags.t option *
     General_name.t option
 
   (** The type of an extension: the critical flag and the value itself. *)
@@ -446,7 +597,7 @@ module Extension : sig
     | Authority_key_id : authority_key_id extension k
     | Subject_key_id : string extension k
     | Issuer_alt_name : General_name.t extension k
-    | Key_usage : key_usage list extension k
+    | Key_usage : Key_usage.t extension k
     | Ext_key_usage : extended_key_usage list extension k
     | Basic_constraints : (bool * int option) extension k
     | CRL_number : int extension k
@@ -454,14 +605,20 @@ module Extension : sig
     | Priv_key_period : priv_key_usage_period extension k
     | Name_constraints : (name_constraint * name_constraint) extension k
     | CRL_distribution_points : distribution_point list extension k
-    | Issuing_distribution_point : (distribution_point_name option * bool * bool * reason list option * bool * bool) extension k
+    | Issuing_distribution_point : (distribution_point_name option * bool * bool * Reason_flags.t option * bool * bool) extension k
     | Freshest_CRL : distribution_point list extension k
     | Reason : reason extension k
     | Invalidity_date : Ptime.t extension k
     | Certificate_issuer : General_name.t extension k
     | Policies : policy list extension k
 
+  (** Lookup and ordinary traversals retain Gmap's key order. Encoding retains
+      original extension order. Replacement keeps position; new keys append.
+      Known EKU OIDs supplied through Other are normalized to named usages at
+      every value-producing operation. *)
   include Gmap.S with type 'a key = 'a k
+  val ordered_bindings : t -> b list
+  val equal_ordered : eq -> t -> t -> bool
 
   (** [critical ext_key ext_value] is the critical bit in [ext_value]. *)
   val critical : 'a key -> 'a -> bool
@@ -476,6 +633,31 @@ end
 
 (** X509v3 certificate *)
 module Certificate : sig
+  module Serial : sig
+    type t
+    val of_z : Z.t -> (t, [> `Msg of string ]) result
+    val to_z : t -> Z.t
+    val of_content : string -> (t, [> `Msg of string ]) result
+    val to_content : t -> string
+    val of_int : int -> t
+    val is_negative : t -> bool
+    val equal : t -> t -> bool
+    val compare : t -> t -> int
+  end
+  module Time : sig
+    type encoding = [ `UTC | `Generalized ]
+    type t
+    val of_ptime : ?encoding:encoding -> Ptime.t -> (t, [> `Msg of string ]) result
+    val time : t -> Ptime.t
+    val encoding : t -> encoding
+  end
+  module Bits : sig
+    type t
+    val create : bit_length:int -> string -> (t, [> `Msg of string ]) result
+    val of_octets : string -> t
+    val octets : t -> string
+    val bit_length : t -> int
+  end
 
   (** [decode_pkcs1_digest_info buffer] is [hash, signature], the hash and raw
       signature of the given [buffer] in ASN.1 DER encoding, or an error. *)
@@ -488,7 +670,8 @@ module Certificate : sig
 
   (** {1 Abstract certificate type} *)
 
-  (** The abstract type of a certificate. *)
+  (** An authoritative semantic certificate, including encoding metadata.
+      No whole-certificate raw encoding is retained. *)
   type t
 
   (** [pp ppf cert] pretty-prints the certificate. *)
@@ -500,8 +683,9 @@ module Certificate : sig
 
   (** {1 Encoding and decoding in ASN.1 DER and PEM format} *)
 
-  (** [decode_der octets] is [certificate], the ASN.1 decoded [certificate]
-      or an error. *)
+  (** [decode_der octets] parses the semantic certificate, then checks exact
+      re-encoding. Inputs which the semantic model would normalize are rejected,
+      rather than retained in a raw-byte cache. This is not trust validation. *)
   val decode_der : string -> (t, [> `Msg of string ]) result
 
   (** [encode_der certificate] is [octets], the ASN.1 encoded representation of
@@ -535,6 +719,13 @@ module Certificate : sig
 
   (** [public_key certificate] is [pk], the public key of the [certificate]. *)
   val public_key : t -> Public_key.t
+  val public_key_info : t -> Public_key.Info.t
+  val signature_identifier : t -> Algorithm_identifier.t
+  val signature : t -> Bits.t
+  val issuer_id : t -> Bits.t option
+  val subject_id : t -> Bits.t option
+  val serial_number : t -> Serial.t
+  val validity_times : t -> Time.t * Time.t
 
   (** [signature_algorithm certificate] is the algorithm used for the signature. *)
   val signature_algorithm : t ->
@@ -571,10 +762,9 @@ module Certificate : sig
       the [certificate]. *)
   val issuer : t -> Distinguished_name.t
 
-  (** [serial certificate] is [sn], the serial number of the [certificate].
-      A serial is a positive number of at most 20 octets. 0 is supported. A
-      negative serial number is supported when decoding a certificate, but when
-      encoding, an octet of 0 is prepended making it positive. *)
+  (** [serial certificate] is canonical signed ASN.1 INTEGER content, without
+      tag or length. Zero and negative serials are preserved; the content is at
+      most 20 octets, including any necessary sign octet. *)
   val serial : t -> string
 
   (** [validity certificate] is [from, until], the validity of the certificate. *)
@@ -868,9 +1058,11 @@ module Signing_request : sig
       addresses. The Public key and subject are taken from the [signing_request]
       unless [subject] is passed, the [extensions] are added to the X.509
       certificate.  The [private] key is used to sign the certificate, the
-      subject of [certificate] is recorded as the issued certificate's issuer. The digest
-      defaults to [`SHA256].  The [serial] defaults to a random value between 1
-      and 2^64.  Certificate version is always 3.  Please note that the
+      subject of [certificate] is recorded as the issuer, preserving its string
+      encodings. The digest defaults to [`SHA256]. Serial content must be canonical
+      signed INTEGER content of at most 20 octets; malformed values return an
+      error. The default is a positive random serial. Validity is truncated to
+      whole seconds at construction. Certificate version is always 3.  Please note that the
       extensions in the [signing_request] are ignored, you can pass them using:
 
 {[match Ext.find Extensions (info csr).extensions with
@@ -891,9 +1083,10 @@ module Signing_request : sig
       and subject are taken from the [signing_request] unless [subject] is
       passed, the [extensions] are added to the X.509 certificate.  The
       [private] key is used to sign the certificate, the [issuer] is recorded
-      in the certificate.  The digest defaults to [`SHA256].  The [serial]
-      defaults to a random value between 1 and 2^64.  Certificate version is
-      always 3.  Please note that the extensions in the [signing_request] are
+      in the certificate. The digest defaults to [`SHA256]. Serial content must
+      be canonical signed INTEGER content of at most 20 octets; malformed values
+      return an error. The default is a positive random serial. Validity is
+      truncated to whole seconds at construction. Certificate version is always 3.  Please note that the extensions in the [signing_request] are
       ignored, you can pass them using:
 
 {[match Ext.find Extensions (info csr).extensions with
@@ -1282,4 +1475,15 @@ module OCSP : sig
       ?now:Ptime.t -> Public_key.t ->
       (unit, [> Validation.signature_error | `No_signature | `Time_invalid ]) result
   end
+end
+
+module Roundtrip_audit : sig
+  type kind = [
+    | `Certificate | `Tbs | `Algorithm | `Name | `General_name | `General_names
+    | `Extensions | `Time | `Serial | `Bits | `Bool | `Octets | `Integer_set
+    | `Public_key
+  ]
+  val reencode : kind -> string -> (string, [ `Msg of string ]) result
+  val fresh_tbs_of_certificate : string -> (string, [ `Msg of string ]) result
+  val certificate_der_of_pem : string -> (string list, [ `Msg of string ]) result
 end

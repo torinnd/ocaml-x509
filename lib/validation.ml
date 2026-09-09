@@ -99,16 +99,18 @@ let raw_cert_hack raw =
   in
   String.sub cert_buf 0 cert_len
 
-let validate_signature allowed_hashes { Certificate.asn = trusted ; _ } { Certificate.asn ; raw } =
-  let tbs_raw = raw_cert_hack raw in
+let validate_signature allowed_hashes trusted ({ Certificate.asn } as cert) =
+  let tbs_raw = Certificate.Asn.tbs_certificate_to_octets asn.tbs_cert in
   validate_raw_signature asn.tbs_cert.subject allowed_hashes tbs_raw
-    asn.signature_algo asn.signature_val trusted.tbs_cert.pk_info
+    (Algorithm.Identifier.algorithm asn.signature_algo)
+    (Certificate.Bits.octets (Certificate.signature cert))
+    (Certificate.public_key trusted)
 
-let validate_time time { Certificate.asn = cert ; _ } =
+let validate_time time cert =
   match time with
   | None     -> true
   | Some now ->
-    let (not_before, not_after) = cert.tbs_cert.validity in
+    let (not_before, not_after) = Certificate.validity cert in
     Ptime.(is_later ~than:not_before now && is_earlier ~than:not_after now)
 
 let version_matches_extensions { Certificate.asn = cert ; _ } =
@@ -150,7 +152,7 @@ let validate_ca_extensions { Certificate.asn = cert ; _ } =
   ( match Extension.(find Key_usage exts) with
     (* When present, conforming CAs SHOULD mark this extension as critical *)
     (* yeah, you wish... *)
-    | Some (_, usage) -> List.mem `Key_cert_sign usage
+    | Some (_, usage) -> Extension.Key_usage.mem `Key_cert_sign usage
     | _ -> false ) &&
 
   (* 4.2.1.12.  Extended Key Usage
@@ -188,7 +190,7 @@ let validate_server_extensions cert =
       | Extension.Key_usage, _ -> true
       | Extension.Ext_key_usage, _ -> true
       | Extension.Subject_alt_name, _ -> true
-      | Extension.Policies, (crit, ps) -> not crit || List.mem `Any ps
+      | Extension.Policies, (crit, ps) -> not crit || List.exists Extension.is_any_policy ps
       | Extension.Name_constraints, _ -> false (* 4.2.1.10 MUST be used only in a CA certificate *)
       (* we've to deal with _all_ extensions marked critical! *)
       | _, _ -> not (Extension.critical k v))

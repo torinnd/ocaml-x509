@@ -184,19 +184,10 @@ and of_signature_algorithm public_key_algorithm digest =
   | (`ED25519, _) -> ED25519
   | _ -> failwith "unsupported signature scheme and hash"
 
-(* XXX
- *
- * PKCS1/RFC5280 allows params to be `ANY', depending on the algorithm.  I don't
- * know of one that uses anything other than NULL and OID, however, so we accept
- * only that.
-
-   RFC 3279 Section 2.2.1 defines for RSA Signature Algorithms SHALL have null
-   as parameter, but certificates in the wild don't contain the parameter field
-   at all (it is optional). We accept both, and output a null paramter.
-   Section 2.2.2 specifies DSA to have a null parameter,
-   Section 2.2.3 specifies ECDSA to have a null parameter,
-   Section 2.3.1 specifies rsaEncryption (for RSA public keys) requires null.
-*)
+(* RSA signature identifiers accept both absent and NULL parameters, whereas
+   rsaEncryption (the RSA public-key algorithm) requires NULL, per RFC 3279
+   section 2.3.1. The legacy [identifier] encoder normalizes RSA signatures;
+   [Identifier] preserves their parameter presence and the OIW SHA1 alias. *)
 
 let curve_of_oid, curve_to_oid =
   let open Registry.ANSI_X9_62 in
@@ -211,7 +202,19 @@ let curve_of_oid, curve_to_oid =
     | `SECP384R1 -> secp384r1
     | `SECP521R1 -> secp521r1)
 
-let identifier =
+type 'a parameter_data = [
+  | `PBE of string * int
+  | `PBKDF2 of string * int * int option * 'a
+  | `PBES2 of 'a * 'a
+]
+
+type 'a parameters = [
+  | `C1 of unit | `C2 of Asn.oid | `C3 of 'a parameter_data | `C4 of string
+]
+
+let (algorithm_of_parameters, parameters_of_algorithm) :
+  (Asn.oid * t parameters option -> t) *
+  (t -> Asn.oid * t parameters option) =
   let open Registry in
 
   let f =
@@ -346,33 +349,128 @@ let identifier =
     | PBKDF2 (s, i, k, m) -> (PKCS5.pbkdf2, pbkdf2 (s, i, k, m))
     | PBES2 (oid, oid') -> (PKCS5.pbes2, pbes2 (oid, oid'))
   in
+  f, g
 
-  fix (fun id ->
-      let pbkdf2_or_pbe_or_pbes2_params =
-        (* TODO PBKDF2 should support `C2 oid (saltSources) *)
-        let f (salt, count, (* key_len, *) prf) =
-          match salt, count, (* key_len, *) prf with
-          | `C1 salt, Some count, (* None, *) None -> `PBE (salt, count)
-          | `C1 salt, Some count, (* x, *) Some prf -> `PBKDF2 (salt, count, None, prf)
-          | `C2 oid, None, (* None, *) Some oid' -> `PBES2 (oid, oid')
-          | _ -> parse_error "bad parameters"
-        and g = function
-          | `PBE (salt, count) -> (`C1 salt, Some count, (* None, *) None)
-          | `PBKDF2 (salt, count, _key_len, prf) -> (`C1 salt, Some count, (* key_len, *) Some prf)
-          | `PBES2 (oid, oid') -> (`C2 oid, None, (* None, *) Some oid')
-        in
-        map f g @@
-        sequence3
-          (required ~label:"salt" (choice2 octet_string id))
-          (optional ~label:"iteration count" int) (* modified - required for pbkdf2/pbes *)
-          (* (optional ~label:"key length" int) (* should be there and optional *) *)
-          (optional ~label:"prf" id) (* only present in pbkdf2 / pbes2 *)
-      in
-      map f g @@
-      sequence2
-        (required ~label:"algorithm" oid)
-        (optional ~label:"params"
-           (choice4 null oid pbkdf2_or_pbe_or_pbes2_params octet_string)))
+let map_parameter_algorithms (f : 'a -> 'b) : 'a parameters option -> 'b parameters option = function
+  | Some (`C3 (`PBKDF2 (salt, count, length, prf))) ->
+    Some (`C3 (`PBKDF2 (salt, count, length, f prf)))
+  | Some (`C3 (`PBES2 (kdf, cipher))) ->
+    Some (`C3 (`PBES2 (f kdf, f cipher)))
+  | Some (`C3 (`PBE params)) -> Some (`C3 (`PBE params))
+  | Some (`C1 ()) -> Some (`C1 ())
+  | Some (`C2 oid) -> Some (`C2 oid)
+  | Some (`C4 octets) -> Some (`C4 octets)
+  | None -> None
+
+let identifier_syntax id =
+  let pbkdf2_or_pbe_or_pbes2_params =
+    (* This shared legacy grammar does not support PBKDF2 saltSources, a key
+       length, or an omitted default PRF. These are not certificate algorithms.
+       [Identifier.of_algorithm] rejects a key length instead of erasing it. *)
+    let f = function
+      | `C1 salt, Some count, None -> `PBE (salt, count)
+      | `C1 salt, Some count, Some prf -> `PBKDF2 (salt, count, None, prf)
+      | `C2 oid, None, Some oid' -> `PBES2 (oid, oid')
+      | _ -> parse_error "bad parameters"
+    and g = function
+      | `PBE (salt, count) -> (`C1 salt, Some count, None)
+      | `PBKDF2 (salt, count, _key_len, prf) -> (`C1 salt, Some count, Some prf)
+      | `PBES2 (oid, oid') -> (`C2 oid, None, Some oid')
+    in
+    map f g @@
+    sequence3
+      (required ~label:"salt" (choice2 octet_string id))
+      (optional ~label:"iteration count" int)
+      (optional ~label:"prf" id)
+  in
+  sequence2
+    (required ~label:"algorithm" oid)
+    (optional ~label:"params"
+       (choice4 null oid pbkdf2_or_pbe_or_pbes2_params octet_string))
+
+module Identifier : sig
+  type algorithm = t
+  type t
+
+  (** Uses conventional OIDs and parameters, including NULL for RSA signatures.
+      Like the legacy grammar, PBKDF2 only supports an octet-string salt, an
+      explicit PRF and no key length. A non-[None] PBKDF2 key length raises
+      [Invalid_argument], including in nested algorithms. *)
+  val of_algorithm : algorithm -> t
+
+  val algorithm : t -> algorithm
+
+  (** Semantic equality: ignores parameter presence and OID aliases. *)
+  val equivalent : t -> t -> bool
+
+  val asn : t Asn.t
+  val encode_der : t -> string
+  val decode_der : string -> (t, [> `Msg of string ]) result
+end = struct
+  type algorithm = t
+
+  (* Algorithm parameters live in [algorithm], not in a DER cache. Only the
+     choices erased by the semantic projection are retained here, recursively
+     for PBKDF2 and PBES2. [Conventional] also covers conventional subtrees. *)
+  type encoding =
+    | Conventional
+    | Rsa_signature of { null_parameters : bool; oiw_sha1 : bool }
+    | Pbkdf2 of encoding
+    | Pbes2 of encoding * encoding
+
+  type t = { algorithm : algorithm; encoding : encoding }
+
+  let rec check_algorithm = function
+    | PBKDF2 (_, _, Some _, _) ->
+      invalid_arg "Algorithm.Identifier: PBKDF2 key length is unsupported"
+    | PBKDF2 (_, _, None, prf) -> check_algorithm prf
+    | PBES2 (kdf, cipher) -> check_algorithm kdf; check_algorithm cipher
+    | _ -> ()
+
+  let of_algorithm algorithm =
+    check_algorithm algorithm;
+    { algorithm; encoding = Conventional }
+
+  let algorithm t = t.algorithm
+  let equivalent a b = a.algorithm = b.algorithm
+
+  let of_parameters (oid, params) =
+    let algorithm = algorithm_of_parameters (oid, map_parameter_algorithms algorithm params) in
+    let encoding = match algorithm, params with
+      | (MD5_RSA | SHA1_RSA | SHA224_RSA | SHA256_RSA | SHA384_RSA | SHA512_RSA), _ ->
+        Rsa_signature {
+          null_parameters = Option.is_some params;
+          oiw_sha1 = Asn.OID.equal oid Registry.sha1_rsa_encryption;
+        }
+      | PBKDF2 _, Some (`C3 (`PBKDF2 (_, _, _, prf))) -> Pbkdf2 prf.encoding
+      | PBES2 _, Some (`C3 (`PBES2 (kdf, cipher))) -> Pbes2 (kdf.encoding, cipher.encoding)
+      | _ -> Conventional
+    in
+    { algorithm; encoding }
+
+  let to_parameters t =
+    let oid, params = parameters_of_algorithm t.algorithm in
+    match t.encoding, params with
+    | Conventional, _ -> oid, map_parameter_algorithms of_algorithm params
+    | Rsa_signature { null_parameters; oiw_sha1 }, _ ->
+      (if oiw_sha1 then Registry.sha1_rsa_encryption else oid),
+      (if null_parameters then Some (`C1 ()) else None)
+    | Pbkdf2 encoding, Some (`C3 (`PBKDF2 (salt, count, length, prf))) ->
+      oid, Some (`C3 (`PBKDF2 (salt, count, length, { algorithm = prf; encoding })))
+    | Pbes2 (kdf_encoding, cipher_encoding), Some (`C3 (`PBES2 (kdf, cipher))) ->
+      oid, Some (`C3 (`PBES2
+        ({ algorithm = kdf; encoding = kdf_encoding },
+         { algorithm = cipher; encoding = cipher_encoding })))
+    | _ -> assert false
+
+  let asn = fix (fun id -> map of_parameters to_parameters (identifier_syntax id))
+  let of_der, encode_der = projections_of Asn.der asn
+  let decode_der der = err_to_msg (of_der der)
+end
+
+(* Legacy callers are a semantic view of the same recursive grammar. Sharing
+   its fixpoint also avoids comparing distinct function keys in Asn's cache. *)
+let identifier = map Identifier.algorithm Identifier.of_algorithm Identifier.asn
 
 let ecdsa_sig =
   sequence2
