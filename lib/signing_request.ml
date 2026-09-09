@@ -124,7 +124,8 @@ let hostnames csr =
     match Distinguished_name.common_name info.subject with
     | None -> Host.Set.empty
     | Some x ->
-      match Host.host x with
+      (* Preserve the legacy byte-oriented CN fallback; do not transcode. *)
+      match Host.host (Distinguished_name.Encoded_string.to_octets x) with
       | Some (typ, n) -> Host.Set.singleton (typ, n)
       | None -> Host.Set.empty
   in

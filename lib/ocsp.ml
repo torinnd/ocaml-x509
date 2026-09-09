@@ -275,7 +275,8 @@ module Request = struct
       let tbs_raw = Validation.raw_cert_hack raw in
       let dn =
         let cn = "OCSP" in
-        [ Distinguished_name.(Relative_distinguished_name.singleton (CN cn)) ]
+        [ Distinguished_name.(Relative_distinguished_name.singleton
+                                  (CN (Encoded_string.of_octets cn))) ]
       in
       Validation.validate_raw_signature dn allowed_hashes tbs_raw
         sign.signatureAlgorithm sign.signature pub
@@ -681,7 +682,8 @@ module Response = struct
       let resp_der = Validation.raw_cert_hack raw_resp in
       let dn =
         let cn = "OCSP" in
-        [ Distinguished_name.(Relative_distinguished_name.singleton (CN cn)) ]
+        [ Distinguished_name.(Relative_distinguished_name.singleton
+                                  (CN (Encoded_string.of_octets cn))) ]
       in
       let* () =
         Validation.validate_raw_signature dn allowed_hashes resp_der
